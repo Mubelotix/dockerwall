@@ -4,6 +4,8 @@ mod manage;
 mod proxy;
 mod state;
 
+use std::net::IpAddr;
+
 use clap::Parser;
 use cli::{Cli, Commands, IpsetCommands};
 
@@ -14,7 +16,13 @@ fn main() {
         Commands::Daemon {
             dns_listen_addr,
             dns_upstream_addr,
-        } => manage::run_daemon(&dns_listen_addr, &dns_upstream_addr),
+        } => {
+            let dns_upstream_addr = dns_upstream_addr
+                .or_else(resolve_upstream_from_resolv_conf)
+                .unwrap_or_else(|| "1.1.1.1:53".to_owned());
+
+            manage::run_daemon(&dns_listen_addr, &dns_upstream_addr)
+        }
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,
@@ -28,4 +36,30 @@ fn main() {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
+}
+
+fn resolve_upstream_from_resolv_conf() -> Option<String> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        if parts.next()? != "nameserver" {
+            continue;
+        }
+
+        let ip_text = parts.next()?;
+        let ip: IpAddr = ip_text.parse().ok()?;
+
+        return Some(match ip {
+            IpAddr::V4(addr) => format!("{addr}:53"),
+            IpAddr::V6(addr) => format!("[{addr}]:53"),
+        });
+    }
+
+    None
 }

@@ -13,8 +13,8 @@ pub enum Commands {
     Daemon {
         #[arg(long, default_value = "127.0.0.1:5353")]
         dns_listen_addr: String,
-        #[arg(long, default_value = "1.1.1.1:53")]
-        dns_upstream_addr: String,
+        #[arg(long)]
+        dns_upstream_addr: Option<String>,
     },
     /// Manage daemon-controlled ipsets.
     Ipset {
