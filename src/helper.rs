@@ -66,7 +66,7 @@ fn subnet_and_gateway(name: &str) -> (String, String) {
     name.hash(&mut hasher);
     let slot = (hasher.finish() % 4096) as u16;
     let third = (slot / 16) as u8;
-    let fourth = ((slot % 16) * 16) as u8;
+    let fourth = (slot % 16) as u8;
 
     let subnet = format!(
         "{}.{}.{}.0/{NETWORK_PREFIX_LENGTH}",
