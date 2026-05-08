@@ -16,6 +16,12 @@ pub enum Commands {
         #[arg(long)]
         dns_upstream_addr: Option<String>,
     },
+    /// Prepare a Docker network, ipset, and firewall rules for allowed domains.
+    PrepareNetwork {
+        name: String,
+        #[arg(required = true, num_args = 1..)]
+        domain_patterns: Vec<String>,
+    },
     /// Manage daemon-controlled ipsets.
     Ipset {
         #[command(subcommand)]

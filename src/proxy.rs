@@ -56,7 +56,7 @@ fn inspect_and_update_state(response: &[u8]) -> Result<(), Box<dyn Error + Send 
         return Ok(());
     }
 
-    let runtime = Builder::new_current_thread().build()?;
+    let runtime = Builder::new_current_thread().enable_io().build()?;
     for (name, ips) in changed_sets {
         if let Err(err) = runtime.block_on(update_ipset(name.clone(), ips)) {
             eprintln!("ipset update error for {name}: {err}");

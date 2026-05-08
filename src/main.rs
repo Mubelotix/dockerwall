@@ -1,8 +1,10 @@
 mod cli;
+mod helper;
 mod ipset;
 mod manage;
 mod proxy;
 mod state;
+mod trust;
 
 use std::net::IpAddr;
 
@@ -23,6 +25,10 @@ fn main() {
 
             manage::run_daemon(&dns_listen_addr, &dns_upstream_addr)
         }
+        Commands::PrepareNetwork {
+            name,
+            domain_patterns,
+        } => helper::prepare_network(&name, &domain_patterns),
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,

@@ -1,19 +1,21 @@
 use std::error::Error;
 use std::net::IpAddr;
-use std::os::unix::fs::MetadataExt;
 use std::process::Stdio;
-use std::fs;
 
 use tokio::process::Command;
+
+use crate::trust::is_trusted_binary;
 
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
 
 pub async fn update_ipset(name: String, ips: Vec<IpAddr>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ipset_binary = resolve_ipset_binary()?;
 
+    let ipv4s: Vec<IpAddr> = ips.into_iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
+
     run_ipset_command(ipset_binary, ["flush", &name]).await?;
 
-    for ip in ips {
+    for ip in ipv4s {
         let ip_text = ip.to_string();
         run_ipset_command(ipset_binary, ["add", &name, &ip_text, "-exist"]).await?;
     }
@@ -29,27 +31,6 @@ fn resolve_ipset_binary() -> Result<&'static str, Box<dyn Error + Send + Sync>> 
     }
 
     Err("trusted ipset binary not found".into())
-}
-
-fn is_trusted_binary(path: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(false),
-    };
-
-    if !metadata.file_type().is_file() {
-        return Ok(false);
-    }
-
-    if metadata.uid() != 0 {
-        return Ok(false);
-    }
-
-    if metadata.mode() & 0o022 != 0 {
-        return Ok(false);
-    }
-
-    Ok(true)
 }
 
 async fn run_ipset_command<I, S>(binary: &str, args: I) -> Result<(), Box<dyn Error + Send + Sync>>
