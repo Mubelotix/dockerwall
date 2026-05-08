@@ -188,6 +188,26 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
             OsString::from("-m"),
             OsString::from("comment"),
             OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{}:allow-local", plan.name)),
+            OsString::from("-s"),
+            OsString::from(&plan.subnet),
+            OsString::from("-d"),
+            OsString::from("172.16.0.0/12"),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from("DOCKER-USER"),
+            OsString::from("4"),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
             OsString::from(format!("dockerwall:{}:drop", plan.name)),
             OsString::from("-s"),
             OsString::from(&plan.subnet),
