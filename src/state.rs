@@ -12,13 +12,13 @@ pub struct ManagedIpset {
 
 pub static STATE: LazyLock<RwLock<HashMap<String, ManagedIpset>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
-pub fn apply_resolved_ips(domains: &[String], resolved_ips: &[IpAddr]) -> Vec<(String, Vec<IpAddr>)> {
+pub async fn apply_resolved_ips(domains: &[String], resolved_ips: &[IpAddr]) -> Vec<(String, Vec<IpAddr>)> {
     if domains.is_empty() || resolved_ips.is_empty() {
         return Vec::new();
     }
 
     let mut changed_sets = Vec::new();
-    let mut state = STATE.blocking_write();
+    let mut state = STATE.write().await;
 
     for (name, managed_ipset) in state.iter_mut() {
         let matches = domains.iter().any(|domain| {

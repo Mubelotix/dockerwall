@@ -13,11 +13,32 @@ pub async fn update_ipset(name: String, ips: Vec<IpAddr>) -> Result<(), Box<dyn 
 
     let ipv4s: Vec<IpAddr> = ips.into_iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
 
-    run_ipset_command(ipset_binary, ["flush", &name]).await?;
-
+    let mut payload = format!("flush {name}\n");
     for ip in ipv4s {
-        let ip_text = ip.to_string();
-        run_ipset_command(ipset_binary, ["add", &name, &ip_text, "-exist"]).await?;
+        payload.push_str(&format!("add {name} {ip} -exist\n"));
+    }
+
+    let mut child = Command::new(ipset_binary)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .arg("restore")
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(payload.as_bytes()).await?;
+    }
+
+    let output = child.wait_with_output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Err(format!("ipset restore failed: {stderr}; stdout: {stdout}").into());
     }
 
     Ok(())
@@ -33,38 +54,4 @@ fn resolve_ipset_binary() -> Result<&'static str, Box<dyn Error + Send + Sync>> 
     Err("trusted ipset binary not found".into())
 }
 
-async fn run_ipset_command<I, S>(binary: &str, args: I) -> Result<(), Box<dyn Error + Send + Sync>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let output = Command::new(binary)
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .args(args)
-        .output()
-        .await?;
 
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-
-    let message = if stderr.is_empty() && stdout.is_empty() {
-        "ipset command failed".to_owned()
-    } else if stdout.is_empty() {
-        format!("ipset command failed: {stderr}")
-    } else if stderr.is_empty() {
-        format!("ipset command failed: stdout: {stdout}")
-    } else {
-        format!("ipset command failed: {stderr}; stdout: {stdout}")
-    };
-
-    Err(message.into())
-}

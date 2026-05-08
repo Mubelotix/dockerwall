@@ -54,12 +54,13 @@ fn resolve_upstream_from_resolv_conf() -> Option<String> {
         }
 
         let mut parts = line.split_whitespace();
-        if parts.next()? != "nameserver" {
+        let Some(first) = parts.next() else { continue };
+        if first != "nameserver" {
             continue;
         }
 
-        let ip_text = parts.next()?;
-        let ip: IpAddr = ip_text.parse().ok()?;
+        let Some(ip_text) = parts.next() else { continue };
+        let Ok(ip) = ip_text.parse::<IpAddr>() else { continue };
 
         return Some(match ip {
             IpAddr::V4(addr) => format!("{addr}:53"),

@@ -1,9 +1,11 @@
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
+use tokio::net::UdpSocket;
 use tokio::runtime::Builder;
 
 use crate::ipset::update_ipset;
@@ -13,33 +15,66 @@ pub fn run_dns_proxy(
     dns_listen_addr: &str,
     dns_upstream_addr: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let listener = UdpSocket::bind(dns_listen_addr)?;
-    let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
-    println!("dockerwall dns proxy listening on {dns_listen_addr}");
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    
+    runtime.block_on(async {
+        let listener = Arc::new(UdpSocket::bind(dns_listen_addr).await?);
+        let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
+        println!("dockerwall dns proxy listening on {dns_listen_addr}");
 
-    loop {
-        let mut request_buf = [0_u8; 4096];
-        let (request_size, client_addr) = listener.recv_from(&mut request_buf)?;
+        loop {
+            let mut request_buf = [0_u8; 4096];
+            let (request_size, client_addr) = match listener.recv_from(&mut request_buf).await {
+                Ok(res) => res,
+                Err(err) => {
+                    eprintln!("proxy recv_from error: {err}");
+                    continue;
+                }
+            };
 
-        let response = forward_dns_query(&request_buf[..request_size], upstream_addr)?;
-        inspect_and_update_state(&response)?;
+            let query = request_buf[..request_size].to_vec();
+            let listener_clone = listener.clone();
 
-        listener.send_to(&response, client_addr)?;
+            tokio::spawn(async move {
+                let response = match forward_dns_query(&query, upstream_addr).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        eprintln!("proxy forward error: {err}");
+                        return;
+                    }
+                };
+
+                if let Err(err) = inspect_and_update_state(&response).await {
+                    eprintln!("proxy state update error: {err}");
+                }
+
+                if let Err(err) = listener_clone.send_to(&response, client_addr).await {
+                    eprintln!("proxy send_to error: {err}");
+                }
+            });
+        }
+    })
+}
+
+async fn forward_dns_query(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let upstream = UdpSocket::bind("0.0.0.0:0").await?;
+    upstream.send_to(query, upstream_addr).await?;
+
+    let mut response_buf = [0_u8; 4096];
+    let result = tokio::time::timeout(Duration::from_secs(5), upstream.recv_from(&mut response_buf)).await;
+    
+    match result {
+        Ok(Ok((response_size, _))) => Ok(response_buf[..response_size].to_vec()),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err("upstream dns timeout".into()),
     }
 }
 
-fn forward_dns_query(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    let upstream = UdpSocket::bind("0.0.0.0:0")?;
-    upstream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    upstream.send_to(query, upstream_addr)?;
-
-    let mut response_buf = [0_u8; 4096];
-    let (response_size, _) = upstream.recv_from(&mut response_buf)?;
-    Ok(response_buf[..response_size].to_vec())
-}
-
-fn inspect_and_update_state(response: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let message = Message::from_vec(response)?;
+async fn inspect_and_update_state(response: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let message = match Message::from_vec(response) {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
     let resolved_ips = collect_resolved_ips(&message);
 
     if resolved_ips.is_empty() {
@@ -51,14 +86,13 @@ fn inspect_and_update_state(response: &[u8]) -> Result<(), Box<dyn Error + Send 
         domains.push(query.name().to_utf8().trim_end_matches('.').to_ascii_lowercase());
     }
 
-    let changed_sets = state::apply_resolved_ips(&domains, &resolved_ips);
+    let changed_sets = state::apply_resolved_ips(&domains, &resolved_ips).await;
     if changed_sets.is_empty() {
         return Ok(());
     }
 
-    let runtime = Builder::new_current_thread().enable_io().build()?;
     for (name, ips) in changed_sets {
-        if let Err(err) = runtime.block_on(update_ipset(name.clone(), ips)) {
+        if let Err(err) = update_ipset(name.clone(), ips).await {
             eprintln!("ipset update error for {name}: {err}");
         }
     }
