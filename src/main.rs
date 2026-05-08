@@ -1,4 +1,5 @@
 mod cli;
+mod state;
 
 fn main() {
     if let Err(err) = cli::run() {
