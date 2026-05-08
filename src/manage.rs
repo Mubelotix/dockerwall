@@ -11,7 +11,9 @@ use crate::state::{ManagedIpset, STATE};
 const CONTROL_SOCKET_PATH: &str = "/run/dockerwall.sock";
 
 pub fn run_daemon(dns_listen_addr: &str, dns_upstream_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let control_thread = thread::spawn(run_control_server);
+    let listen_addr: std::net::SocketAddr = dns_listen_addr.parse()?;
+    let dns_port = listen_addr.port();
+    let control_thread = thread::spawn(move || run_control_server(dns_port));
     proxy::run_dns_proxy(dns_listen_addr, dns_upstream_addr)?;
 
     match control_thread.join() {
@@ -53,7 +55,27 @@ fn send_control_command(payload: &str) -> Result<(), Box<dyn Error + Send + Sync
     Err("invalid daemon response".into())
 }
 
-fn handle_control_connection(mut stream: UnixStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn get_dns_port() -> Result<u16, Box<dyn Error + Send + Sync>> {
+    let mut stream = UnixStream::connect(CONTROL_SOCKET_PATH)?;
+    stream.write_all(b"INFO\n")?;
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut response)?;
+
+    if let Some(rest) = response.strip_prefix("OK\t") {
+        let port: u16 = rest.trim_end().parse()?;
+        return Ok(port);
+    }
+
+    if let Some(message) = response.trim_end().strip_prefix("ERR\t") {
+        return Err(message.to_owned().into());
+    }
+
+    Err("invalid daemon response".into())
+}
+
+fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut line = String::new();
     {
         let mut reader = BufReader::new(&mut stream);
@@ -61,6 +83,11 @@ fn handle_control_connection(mut stream: UnixStream) -> Result<(), Box<dyn Error
     }
 
     let command = line.trim_end();
+
+    if command == "INFO" {
+        stream.write_all(format!("OK\t{dns_port}\n").as_bytes())?;
+        return Ok(());
+    }
 
     if let Some(rest) = command.strip_prefix("CREATE\t") {
         let mut parts = rest.splitn(2, '\t');
@@ -114,7 +141,7 @@ fn handle_control_connection(mut stream: UnixStream) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-fn run_control_server() -> Result<(), Box<dyn Error + Send + Sync>> {
+fn run_control_server(dns_port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
     if Path::new(CONTROL_SOCKET_PATH).exists() {
         fs::remove_file(CONTROL_SOCKET_PATH)?;
     }
@@ -126,7 +153,7 @@ fn run_control_server() -> Result<(), Box<dyn Error + Send + Sync>> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle_control_connection(stream) {
+                if let Err(err) = handle_control_connection(stream, dns_port) {
                     eprintln!("control error: {err}");
                 }
             }

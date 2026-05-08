@@ -19,8 +19,9 @@ const NETWORK_PREFIX_OCTET: u8 = 172;
 const NETWORK_PREFIX_LENGTH: u8 = 28;
 
 pub fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let dns_port = manage::get_dns_port()?;
     let runtime = Builder::new_current_thread().enable_io().build()?;
-    let plan = NetworkPlan::new(name);
+    let plan = NetworkPlan::new(name, dns_port);
 
     runtime.block_on(setup_local_resources(&plan))?;
     manage::send_create(name, domain_patterns)?;
@@ -48,15 +49,17 @@ struct NetworkPlan {
     name: String,
     subnet: String,
     gateway: String,
+    dns_port: u16,
 }
 
 impl NetworkPlan {
-    fn new(name: &str) -> Self {
+    fn new(name: &str, dns_port: u16) -> Self {
         let (subnet, gateway) = subnet_and_gateway(name);
         Self {
             name: name.to_owned(),
             subnet,
             gateway,
+            dns_port,
         }
     }
 }
@@ -194,6 +197,56 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
     )
     .await?;
 
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-t"),
+            OsString::from("nat"),
+            OsString::from("-I"),
+            OsString::from("PREROUTING"),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{}:dns-udp", plan.name)),
+            OsString::from("-s"),
+            OsString::from(&plan.subnet),
+            OsString::from("-p"),
+            OsString::from("udp"),
+            OsString::from("--dport"),
+            OsString::from("53"),
+            OsString::from("-j"),
+            OsString::from("DNAT"),
+            OsString::from("--to-destination"),
+            OsString::from(format!("{}:{}", plan.gateway, plan.dns_port)),
+        ],
+    )
+    .await?;
+
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-t"),
+            OsString::from("nat"),
+            OsString::from("-I"),
+            OsString::from("PREROUTING"),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{}:dns-tcp", plan.name)),
+            OsString::from("-s"),
+            OsString::from(&plan.subnet),
+            OsString::from("-p"),
+            OsString::from("tcp"),
+            OsString::from("--dport"),
+            OsString::from("53"),
+            OsString::from("-j"),
+            OsString::from("DNAT"),
+            OsString::from("--to-destination"),
+            OsString::from(format!("{}:{}", plan.gateway, plan.dns_port)),
+        ],
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -215,8 +268,11 @@ async fn remove_rule_all(binary: &str, args: &[OsString]) -> Result<(), Box<dyn 
 
 fn delete_args(insert_args: &[OsString]) -> Vec<OsString> {
     let mut args = insert_args.to_vec();
-    if let Some(first) = args.get_mut(0) {
-        *first = OsString::from("-D");
+    for arg in args.iter_mut() {
+        if arg == "-I" || arg == "-A" {
+            *arg = OsString::from("-D");
+            break;
+        }
     }
     args
 }
