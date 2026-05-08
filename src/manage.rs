@@ -4,33 +4,20 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-
+use std::thread;
+use crate::proxy;
 use crate::state::{ManagedIpset, STATE};
 
 const CONTROL_SOCKET_PATH: &str = "/run/dockerwall.sock";
 
 pub fn run_daemon() -> Result<(), Box<dyn Error + Send + Sync>> {
-    if Path::new(CONTROL_SOCKET_PATH).exists() {
-        fs::remove_file(CONTROL_SOCKET_PATH)?;
+    let control_thread = thread::spawn(run_control_server);
+    proxy::run_dns_proxy()?;
+
+    match control_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("control server thread panicked".into()),
     }
-
-    let listener = UnixListener::bind(CONTROL_SOCKET_PATH)?;
-    fs::set_permissions(CONTROL_SOCKET_PATH, fs::Permissions::from_mode(0o600))?;
-
-    println!("dockerwall daemon listening on {CONTROL_SOCKET_PATH}");
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if let Err(err) = handle_control_connection(stream) {
-                    eprintln!("control error: {err}");
-                }
-            }
-            Err(err) => eprintln!("accept error: {err}"),
-        }
-    }
-
-    Ok(())
 }
 
 pub fn send_create(name: &str, allowed_domains: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -102,7 +89,7 @@ fn handle_control_connection(mut stream: UnixStream) -> Result<(), Box<dyn Error
             name.to_owned(),
             ManagedIpset {
                 allowed_domain_patterns,
-                ips: Vec::new(),
+                ips: Default::default(),
             },
         );
 
@@ -124,5 +111,28 @@ fn handle_control_connection(mut stream: UnixStream) -> Result<(), Box<dyn Error
     }
 
     stream.write_all(b"ERR\tunknown command\n")?;
+    Ok(())
+}
+
+fn run_control_server() -> Result<(), Box<dyn Error + Send + Sync>> {
+    if Path::new(CONTROL_SOCKET_PATH).exists() {
+        fs::remove_file(CONTROL_SOCKET_PATH)?;
+    }
+
+    let listener = UnixListener::bind(CONTROL_SOCKET_PATH)?;
+    fs::set_permissions(CONTROL_SOCKET_PATH, fs::Permissions::from_mode(0o600))?;
+    println!("dockerwall control socket listening on {CONTROL_SOCKET_PATH}");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(err) = handle_control_connection(stream) {
+                    eprintln!("control error: {err}");
+                }
+            }
+            Err(err) => eprintln!("accept error: {err}"),
+        }
+    }
+
     Ok(())
 }

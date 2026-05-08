@@ -1,5 +1,7 @@
 mod cli;
+mod ipset;
 mod manage;
+mod proxy;
 mod state;
 
 use clap::Parser;
