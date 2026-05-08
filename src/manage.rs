@@ -10,9 +10,9 @@ use crate::state::{ManagedIpset, STATE};
 
 const CONTROL_SOCKET_PATH: &str = "/run/dockerwall.sock";
 
-pub fn run_daemon() -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn run_daemon(dns_listen_addr: &str, dns_upstream_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let control_thread = thread::spawn(run_control_server);
-    proxy::run_dns_proxy()?;
+    proxy::run_dns_proxy(dns_listen_addr, dns_upstream_addr)?;
 
     match control_thread.join() {
         Ok(result) => result,

@@ -10,7 +10,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Run the daemon and open the local DNS proxy listener.
-    Daemon,
+    Daemon {
+        #[arg(long, default_value = "127.0.0.1:5353")]
+        dns_listen_addr: String,
+        #[arg(long, default_value = "1.1.1.1:53")]
+        dns_upstream_addr: String,
+    },
     /// Manage daemon-controlled ipsets.
     Ipset {
         #[command(subcommand)]

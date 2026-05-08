@@ -9,13 +9,13 @@ use tokio::runtime::Builder;
 use crate::ipset::update_ipset;
 use crate::state;
 
-const DNS_LISTEN_ADDR: &str = "127.0.0.1:5353";
-const DNS_UPSTREAM_ADDR: &str = "1.1.1.1:53";
-
-pub fn run_dns_proxy() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let listener = UdpSocket::bind(DNS_LISTEN_ADDR)?;
-    let upstream_addr: SocketAddr = DNS_UPSTREAM_ADDR.parse()?;
-    println!("dockerwall dns proxy listening on {DNS_LISTEN_ADDR}");
+pub fn run_dns_proxy(
+    dns_listen_addr: &str,
+    dns_upstream_addr: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let listener = UdpSocket::bind(dns_listen_addr)?;
+    let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
+    println!("dockerwall dns proxy listening on {dns_listen_addr}");
 
     loop {
         let mut request_buf = [0_u8; 4096];

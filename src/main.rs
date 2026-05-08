@@ -11,7 +11,10 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Daemon => manage::run_daemon(),
+        Commands::Daemon {
+            dns_listen_addr,
+            dns_upstream_addr,
+        } => manage::run_daemon(&dns_listen_addr, &dns_upstream_addr),
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,
