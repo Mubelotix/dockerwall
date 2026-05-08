@@ -1,16 +1,14 @@
-use std::error::Error;
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "dockerwall", version, about = "Dockerwall daemon and ipset manager")]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    pub command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
+pub enum Commands {
     /// Run the daemon and open the local DNS proxy listener.
     Daemon,
     /// Manage daemon-controlled ipsets.
@@ -21,7 +19,7 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
-enum IpsetCommands {
+pub enum IpsetCommands {
     /// Create an ipset with one or more allowed domains.
     Create {
         name: String,
@@ -30,19 +28,4 @@ enum IpsetCommands {
     },
     /// Remove an existing ipset.
     Remove { name: String },
-}
-
-pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Daemon => todo!(),
-        Commands::Ipset { command } => match command {
-            IpsetCommands::Create {
-                name: _,
-                allowed_domains: _,
-            } => todo!(),
-            IpsetCommands::Remove { name: _ } => todo!(),
-        },
-    }
 }
