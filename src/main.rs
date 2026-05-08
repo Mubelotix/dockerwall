@@ -2,22 +2,13 @@ mod cli;
 mod manage;
 mod state;
 
-use std::error::Error;
-
 use clap::Parser;
 use cli::{Cli, Commands, IpsetCommands};
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Daemon => manage::run_daemon(),
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
@@ -26,5 +17,10 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             } => manage::send_create(&name, &allowed_domains),
             IpsetCommands::Remove { name } => manage::send_remove(&name),
         },
+    };
+
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }
