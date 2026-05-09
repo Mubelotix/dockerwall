@@ -9,7 +9,7 @@ use crate::trust::is_trusted_binary;
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
 
 pub async fn update_ipset(name: String, ips: Vec<IpAddr>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let ipset_binary = resolve_ipset_binary()?;
+    let ipset_binary = resolve_ipset_binary().await?;
 
     let ipv4s: Vec<IpAddr> = ips.into_iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
 
@@ -44,9 +44,9 @@ pub async fn update_ipset(name: String, ips: Vec<IpAddr>) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn resolve_ipset_binary() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+async fn resolve_ipset_binary() -> Result<&'static str, Box<dyn Error + Send + Sync>> {
     for candidate in IPSET_CANDIDATES {
-        if is_trusted_binary(candidate)? {
+        if is_trusted_binary(candidate).await? {
             return Ok(candidate);
         }
     }

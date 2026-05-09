@@ -1,9 +1,8 @@
 use std::error::Error;
-use std::fs;
 use std::os::unix::fs::MetadataExt;
 
-pub fn is_trusted_binary(path: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let metadata = match fs::metadata(path) {
+pub async fn is_trusted_binary(path: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(_) => return Ok(false),
     };

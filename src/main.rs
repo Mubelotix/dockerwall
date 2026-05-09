@@ -14,34 +14,36 @@ use std::net::IpAddr;
 use clap::Parser;
 use cli::{Cli, Commands, IpsetCommands};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Stats => stats::send_stats(),
+        Commands::Stats => stats::send_stats().await,
         Commands::Daemon {
             dns_listen_addr,
             dns_upstream_addr,
             stats_ttl,
         } => {
-            let dns_upstream_addr = dns_upstream_addr
-                .or_else(resolve_upstream_from_resolv_conf)
-                .unwrap_or_else(|| "1.1.1.1:53".to_owned());
+            let dns_upstream_addr = match dns_upstream_addr {
+                Some(addr) => addr,
+                None => resolve_upstream_from_resolv_conf().await.unwrap_or_else(|| "1.1.1.1:53".to_owned()),
+            };
 
             let stats_ttl = std::time::Duration::from_secs(stats_ttl);
 
-            daemon::run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl)
+            daemon::run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl).await
         }
         Commands::PrepareNetwork {
             name,
             domain_patterns,
-        } => helper::prepare_network(&name, &domain_patterns),
+        } => helper::prepare_network(&name, &domain_patterns).await,
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,
                 allowed_domains,
-            } => manage::send_create(&name, None, &allowed_domains),
-            IpsetCommands::Remove { name } => manage::send_remove(&name),
+            } => manage::send_create(&name, None, &allowed_domains).await,
+            IpsetCommands::Remove { name } => manage::send_remove(&name).await,
         },
     };
 
@@ -51,8 +53,8 @@ fn main() {
     }
 }
 
-fn resolve_upstream_from_resolv_conf() -> Option<String> {
-    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+async fn resolve_upstream_from_resolv_conf() -> Option<String> {
+    let contents = tokio::fs::read_to_string("/etc/resolv.conf").await.ok()?;
 
     for raw_line in contents.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();

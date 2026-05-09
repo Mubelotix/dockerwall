@@ -6,55 +6,50 @@ use std::time::Duration;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
 use tokio::net::UdpSocket;
-use tokio::runtime::Builder;
 
 use crate::ipset::update_ipset;
 use crate::state;
 use crate::stats;
-pub fn run_dns_proxy(
+pub async fn run_dns_proxy(
     dns_listen_addr: &str,
     dns_upstream_addr: &str,
     stats_ttl: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let runtime = Builder::new_multi_thread().enable_all().build()?;
-    
-    runtime.block_on(async {
-        let listener = Arc::new(UdpSocket::bind(dns_listen_addr).await?);
-        let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
-        println!("dockerwall dns proxy listening on {dns_listen_addr}");
+    let listener = Arc::new(UdpSocket::bind(dns_listen_addr).await?);
+    let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
+    println!("dockerwall dns proxy listening on {dns_listen_addr}");
 
-        loop {
-            let mut request_buf = [0_u8; 4096];
-            let (request_size, client_addr) = match listener.recv_from(&mut request_buf).await {
+    loop {
+        let mut request_buf = [0_u8; 4096];
+        let (request_size, client_addr) = match listener.recv_from(&mut request_buf).await {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("proxy recv_from error: {err}");
+                continue;
+            }
+        };
+
+        let query = request_buf[..request_size].to_vec();
+        let listener_clone = listener.clone();
+
+        tokio::spawn(async move {
+            let response = match forward_dns_query(&query, upstream_addr).await {
                 Ok(res) => res,
                 Err(err) => {
-                    eprintln!("proxy recv_from error: {err}");
-                    continue;
+                    eprintln!("proxy forward error: {err}");
+                    return;
                 }
             };
 
-            let query = request_buf[..request_size].to_vec();
-            let listener_clone = listener.clone();
+            if let Err(err) = inspect_and_update_state(&response, client_addr.ip(), stats_ttl).await {
+                eprintln!("proxy state update error: {err}");
+            }
 
-            tokio::spawn(async move {
-                let response = match forward_dns_query(&query, upstream_addr).await {
-                    Ok(res) => res,
-                    Err(err) => {
-                        eprintln!("proxy forward error: {err}");
-                        return;
-                    }
-                };
-
-                if let Err(err) = inspect_and_update_state(&response, client_addr.ip(), stats_ttl).await {
-                    eprintln!("proxy state update error: {err}");
-                }
-
-                if let Err(err) = listener_clone.send_to(&response, client_addr).await {
-                    eprintln!("proxy send_to error: {err}");
-                }
-            });
-        }
-    })
+            if let Err(err) = listener_clone.send_to(&response, client_addr).await {
+                eprintln!("proxy send_to error: {err}");
+            }
+        });
+    }
 }
 
 async fn forward_dns_query(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {

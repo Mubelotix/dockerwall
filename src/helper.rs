@@ -5,7 +5,6 @@ use std::hash::{Hash, Hasher};
 use std::process::Stdio;
 
 use tokio::process::Command;
-use tokio::runtime::Builder;
 
 use crate::control;
 use crate::manage;
@@ -19,21 +18,20 @@ const NETWORK_BASE_OCTET: u8 = 30;
 const NETWORK_PREFIX_OCTET: u8 = 172;
 const NETWORK_PREFIX_LENGTH: u8 = 28;
 
-pub fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let dns_port = control::get_dns_port()?;
-    let runtime = Builder::new_current_thread().enable_io().build()?;
+pub async fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let dns_port = control::get_dns_port().await?;
     let plan = NetworkPlan::new(name, dns_port);
 
-    runtime.block_on(setup_local_resources(&plan))?;
-    manage::send_create(name, Some(&plan.subnet), domain_patterns)?;
+    setup_local_resources(&plan).await?;
+    manage::send_create(name, Some(&plan.subnet), domain_patterns).await?;
 
     Ok(())
 }
 
 async fn setup_local_resources(plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let ipset_binary = resolve_binary(&IPSET_CANDIDATES)?;
-    let docker_binary = resolve_binary(&DOCKER_CANDIDATES)?;
-    let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES)?;
+    let ipset_binary = resolve_binary(&IPSET_CANDIDATES).await?;
+    let docker_binary = resolve_binary(&DOCKER_CANDIDATES).await?;
+    let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES).await?;
 
     destroy_ipset(ipset_binary, &plan.name).await?;
     create_ipset(ipset_binary, &plan.name).await?;
@@ -81,9 +79,9 @@ fn subnet_and_gateway(name: &str) -> (String, String) {
     (subnet, gateway)
 }
 
-fn resolve_binary(candidates: &'static [&'static str]) -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+async fn resolve_binary(candidates: &'static [&'static str]) -> Result<&'static str, Box<dyn Error + Send + Sync>> {
     for candidate in candidates {
-        if is_trusted_binary(candidate)? {
+        if is_trusted_binary(candidate).await? {
             return Ok(candidate);
         }
     }

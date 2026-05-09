@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use crate::control::CONTROL_SOCKET_PATH;
 
 #[derive(Debug, Clone)]
@@ -40,9 +40,9 @@ pub static SUBNET_TO_ID: LazyLock<RwLock<HashMap<String, u32>>> = LazyLock::new(
 
 static NEXT_NETWORK_ID: AtomicU32 = AtomicU32::new(1);
 
-pub fn register_network(name: String, subnet: String) {
-    let mut subnet_map = SUBNET_TO_ID.blocking_write();
-    let mut registry = NETWORK_REGISTRY.blocking_write();
+pub async fn register_network(name: String, subnet: String) {
+    let mut subnet_map = SUBNET_TO_ID.write().await;
+    let mut registry = NETWORK_REGISTRY.write().await;
 
     if let Some(&id) = subnet_map.get(&subnet) {
         // Update existing network info if name changed? Or just keep it.
@@ -97,9 +97,9 @@ pub async fn record_resolve(domain: &str, origin: IpAddr, ttl: Duration) {
     entry.accepted = accepted;
 }
 
-pub fn get_stats_report() -> String {
-    let registry = NETWORK_REGISTRY.blocking_read();
-    let stats = STATS.blocking_read();
+pub async fn get_stats_report() -> String {
+    let registry = NETWORK_REGISTRY.read().await;
+    let stats = STATS.read().await;
     let now = SystemTime::now();
 
     let mut report = String::new();
@@ -188,13 +188,13 @@ pub fn get_stats_report() -> String {
     report
 }
 
-pub fn send_stats() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut stream = UnixStream::connect(CONTROL_SOCKET_PATH)?;
-    stream.write_all(b"STATS\n")?;
+pub async fn send_stats() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut stream = UnixStream::connect(CONTROL_SOCKET_PATH).await?;
+    stream.write_all(b"STATS\n").await?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    while reader.read_line(&mut line)? > 0 {
+    while reader.read_line(&mut line).await? > 0 {
         print!("{line}");
         line.clear();
     }
