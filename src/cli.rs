@@ -19,7 +19,7 @@ pub enum Commands {
     /// Prepare a Docker network, ipset, and firewall rules for allowed domains.
     PrepareNetwork {
         name: String,
-        #[arg(required = true, num_args = 1..)]
+        #[arg(num_args = 0..)]
         domain_patterns: Vec<String>,
     },
     /// Manage daemon-controlled ipsets.
@@ -36,7 +36,7 @@ pub enum IpsetCommands {
     /// Create an ipset with one or more allowed domains.
     Create {
         name: String,
-        #[arg(required = true, num_args = 1..)]
+        #[arg(num_args = 0..)]
         allowed_domains: Vec<String>,
     },
     /// Remove an existing ipset.

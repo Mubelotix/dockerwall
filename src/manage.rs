@@ -82,7 +82,7 @@ fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Result<()
         reader.read_line(&mut line)?;
     }
 
-    let command = line.trim_end();
+    let command = line.trim_end_matches('\n');
 
     if command == "RECORD" {
         stream.write_all(b"OK\n")?;
@@ -121,11 +121,6 @@ fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Result<()
             .filter(|domain| !domain.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-
-        if allowed_domain_patterns.is_empty() {
-            stream.write_all(b"ERR\tno allowed domains provided\n")?;
-            return Ok(());
-        }
 
         let mut state = STATE.blocking_write();
         state.insert(
