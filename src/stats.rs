@@ -10,6 +10,8 @@ use tokio::net::UnixStream;
 use crate::control::CONTROL_SOCKET_PATH;
 use crate::state::is_domain_accepted_by_network;
 
+const MAX_STATS_ENTRIES: usize = 1_000_000;
+
 #[derive(Debug, Clone)]
 pub struct StatEntry {
     pub count: u64,
@@ -86,7 +88,12 @@ pub async fn record_resolve(domain: &str, origin: IpAddr, ttl: Duration) {
         now.duration_since(entry.last_seen).unwrap_or(Duration::ZERO) < ttl
     });
 
-    let entry = stats.entry((domain.to_string(), origin)).or_insert(StatEntry {
+    let key = (domain.to_string(), origin);
+    if !stats.contains_key(&key) && stats.len() >= MAX_STATS_ENTRIES {
+        return;
+    }
+
+    let entry = stats.entry(key).or_insert(StatEntry {
         count: 0,
         last_seen: now,
         network_id,
