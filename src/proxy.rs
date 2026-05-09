@@ -6,10 +6,12 @@ use std::time::Duration;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
 use tokio::net::UdpSocket;
+use tokio::spawn;
+use tokio::time::timeout;
 
 use crate::ipset::update_ipset;
-use crate::state;
-use crate::stats;
+use crate::state::apply_resolved_ips;
+use crate::stats::record_resolve;
 pub async fn run_dns_proxy(
     dns_listen_addr: &str,
     dns_upstream_addr: &str,
@@ -32,7 +34,7 @@ pub async fn run_dns_proxy(
         let query = request_buf[..request_size].to_vec();
         let listener_clone = listener.clone();
 
-        tokio::spawn(async move {
+        spawn(async move {
             let response = match forward_dns_query(&query, upstream_addr).await {
                 Ok(res) => res,
                 Err(err) => {
@@ -57,7 +59,7 @@ async fn forward_dns_query(query: &[u8], upstream_addr: SocketAddr) -> Result<Ve
     upstream.send_to(query, upstream_addr).await?;
 
     let mut response_buf = [0_u8; 4096];
-    let result = tokio::time::timeout(Duration::from_secs(5), upstream.recv_from(&mut response_buf)).await;
+    let result = timeout(Duration::from_secs(5), upstream.recv_from(&mut response_buf)).await;
     
     match result {
         Ok(Ok((response_size, _))) => Ok(response_buf[..response_size].to_vec()),
@@ -75,7 +77,7 @@ async fn inspect_and_update_state(response: &[u8], origin: IpAddr, stats_ttl: Du
     let mut domains = Vec::new();
     for query in &message.queries {
         let domain = query.name().to_utf8().trim_end_matches('.').to_ascii_lowercase();
-        stats::record_resolve(&domain, origin, stats_ttl).await;
+        record_resolve(&domain, origin, stats_ttl).await;
         domains.push(domain);
     }
 
@@ -83,7 +85,7 @@ async fn inspect_and_update_state(response: &[u8], origin: IpAddr, stats_ttl: Du
         return Ok(());
     }
 
-    let changed_sets = state::apply_resolved_ips(&domains, &resolved_ips).await;
+    let changed_sets = apply_resolved_ips(&domains, &resolved_ips).await;
     if changed_sets.is_empty() {
         return Ok(());
     }

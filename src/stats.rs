@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use crate::control::CONTROL_SOCKET_PATH;
+use crate::state::is_domain_accepted_by_network;
 
 #[derive(Debug, Clone)]
 pub struct StatEntry {
@@ -74,7 +75,7 @@ pub async fn record_resolve(domain: &str, origin: IpAddr, ttl: Duration) {
     };
 
     let accepted = if let Some(name) = &network_name {
-        Some(crate::state::is_domain_accepted_by_network(domain, name).await)
+        Some(is_domain_accepted_by_network(domain, name).await)
     } else {
         None
     };

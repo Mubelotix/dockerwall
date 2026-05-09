@@ -2,12 +2,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use tokio::process::Command;
 
-use crate::control;
-use crate::manage;
+use crate::control::get_dns_port;
+use crate::manage::send_create;
 use crate::trust::is_trusted_binary;
 
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
@@ -19,11 +19,11 @@ const NETWORK_PREFIX_OCTET: u8 = 172;
 const NETWORK_PREFIX_LENGTH: u8 = 28;
 
 pub async fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let dns_port = control::get_dns_port().await?;
+    let dns_port = get_dns_port().await?;
     let plan = NetworkPlan::new(name, dns_port);
 
     setup_local_resources(&plan).await?;
-    manage::send_create(name, Some(&plan.subnet), domain_patterns).await?;
+    send_create(name, Some(&plan.subnet), domain_patterns).await?;
 
     Ok(())
 }
@@ -296,7 +296,7 @@ fn delete_args(insert_args: &[OsString]) -> Vec<OsString> {
     args
 }
 
-async fn run_command_allow_failure<I, S>(binary: &str, args: I) -> Result<std::process::Output, Box<dyn Error + Send + Sync>>
+async fn run_command_allow_failure<I, S>(binary: &str, args: I) -> Result<Output, Box<dyn Error + Send + Sync>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,

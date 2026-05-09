@@ -1,11 +1,14 @@
 use std::error::Error;
+use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::spawn;
 
 use crate::state::{ManagedIpset, STATE};
+use crate::stats::{get_stats_report, register_network};
 
 pub const CONTROL_SOCKET_PATH: &str = "/run/dockerwall.sock";
 
@@ -15,13 +18,13 @@ pub async fn run_control_server(dns_port: u16) -> Result<(), Box<dyn Error + Sen
     }
 
     let listener = UnixListener::bind(CONTROL_SOCKET_PATH)?;
-    fs::set_permissions(CONTROL_SOCKET_PATH, std::fs::Permissions::from_mode(0o600)).await?;
+    fs::set_permissions(CONTROL_SOCKET_PATH, Permissions::from_mode(0o600)).await?;
     println!("dockerwall control socket listening on {CONTROL_SOCKET_PATH}");
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(async move {
+                spawn(async move {
                     if let Err(err) = handle_control_connection(stream, dns_port).await {
                         eprintln!("control error: {err}");
                     }
@@ -42,7 +45,7 @@ async fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Res
     let command = line.trim_end_matches('\n');
 
     if command == "STATS" {
-        let report = crate::stats::get_stats_report().await;
+        let report = get_stats_report().await;
         stream.write_all(report.as_bytes()).await?;
         return Ok(());
     }
@@ -64,7 +67,7 @@ async fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Res
         }
 
         if !subnet.is_empty() {
-            crate::stats::register_network(name.to_owned(), subnet.to_owned()).await;
+            register_network(name.to_owned(), subnet.to_owned()).await;
         }
 
         let allowed_domain_patterns: Vec<String> = raw_domains
