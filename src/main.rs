@@ -19,12 +19,15 @@ fn main() {
         Commands::Daemon {
             dns_listen_addr,
             dns_upstream_addr,
+            stats_ttl,
         } => {
             let dns_upstream_addr = dns_upstream_addr
                 .or_else(resolve_upstream_from_resolv_conf)
                 .unwrap_or_else(|| "1.1.1.1:53".to_owned());
 
-            manage::run_daemon(&dns_listen_addr, &dns_upstream_addr)
+            let stats_ttl = std::time::Duration::from_secs(stats_ttl);
+
+            manage::run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl)
         }
         Commands::PrepareNetwork {
             name,

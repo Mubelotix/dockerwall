@@ -15,6 +15,8 @@ pub enum Commands {
         dns_listen_addr: String,
         #[arg(long)]
         dns_upstream_addr: Option<String>,
+        #[arg(long, default_value = "86400")]
+        stats_ttl: u64,
     },
     /// Prepare a Docker network, ipset, and firewall rules for allowed domains.
     PrepareNetwork {

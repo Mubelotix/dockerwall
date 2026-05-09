@@ -11,10 +11,10 @@ use tokio::runtime::Builder;
 use crate::ipset::update_ipset;
 use crate::state;
 use crate::stats;
-
 pub fn run_dns_proxy(
     dns_listen_addr: &str,
     dns_upstream_addr: &str,
+    stats_ttl: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     
@@ -45,7 +45,7 @@ pub fn run_dns_proxy(
                     }
                 };
 
-                if let Err(err) = inspect_and_update_state(&response, client_addr.ip()).await {
+                if let Err(err) = inspect_and_update_state(&response, client_addr.ip(), stats_ttl).await {
                     eprintln!("proxy state update error: {err}");
                 }
 
@@ -71,7 +71,7 @@ async fn forward_dns_query(query: &[u8], upstream_addr: SocketAddr) -> Result<Ve
     }
 }
 
-async fn inspect_and_update_state(response: &[u8], origin: IpAddr) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn inspect_and_update_state(response: &[u8], origin: IpAddr, stats_ttl: Duration) -> Result<(), Box<dyn Error + Send + Sync>> {
     let message = match Message::from_vec(response) {
         Ok(m) => m,
         Err(_) => return Ok(()),
@@ -85,7 +85,7 @@ async fn inspect_and_update_state(response: &[u8], origin: IpAddr) -> Result<(),
     let mut domains = Vec::new();
     for query in &message.queries {
         let domain = query.name().to_utf8().trim_end_matches('.').to_ascii_lowercase();
-        stats::record_resolve(&domain, origin).await;
+        stats::record_resolve(&domain, origin, stats_ttl).await;
         domains.push(domain);
     }
 

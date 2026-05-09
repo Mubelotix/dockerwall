@@ -5,16 +5,22 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::thread;
+use std::time::Duration;
 use crate::proxy;
 use crate::state::{ManagedIpset, STATE};
 
 const CONTROL_SOCKET_PATH: &str = "/run/dockerwall.sock";
 
-pub fn run_daemon(dns_listen_addr: &str, dns_upstream_addr: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+
+pub fn run_daemon(
+    dns_listen_addr: &str,
+    dns_upstream_addr: &str,
+    stats_ttl: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listen_addr: std::net::SocketAddr = dns_listen_addr.parse()?;
     let dns_port = listen_addr.port();
     let control_thread = thread::spawn(move || run_control_server(dns_port));
-    proxy::run_dns_proxy(dns_listen_addr, dns_upstream_addr)?;
+    proxy::run_dns_proxy(dns_listen_addr, dns_upstream_addr, stats_ttl)?;
 
     match control_thread.join() {
         Ok(result) => result,
