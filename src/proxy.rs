@@ -1,17 +1,27 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
 use tokio::net::UdpSocket;
 use tokio::spawn;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time::timeout;
 
 use crate::ipset::update_ipset;
 use crate::state::apply_resolved_ips;
 use crate::stats::record_resolve;
+
+static PER_IP_LIMITS: LazyLock<RwLock<HashMap<IpAddr, Arc<Semaphore>>>> = LazyLock::new(|| {
+    RwLock::new(HashMap::new())
+});
+
+const MAX_CONCURRENT_PER_IP: usize = 32;
+const MAX_CONCURRENT_GLOBAL: usize = 10000;
+
 pub async fn run_dns_proxy(
     dns_listen_addr: &str,
     dns_upstream_addr: &str,
@@ -19,6 +29,7 @@ pub async fn run_dns_proxy(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = Arc::new(UdpSocket::bind(dns_listen_addr).await?);
     let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
+    let global_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_GLOBAL));
     println!("dockerwall dns proxy listening on {dns_listen_addr}");
 
     loop {
@@ -33,8 +44,27 @@ pub async fn run_dns_proxy(
 
         let query = request_buf[..request_size].to_vec();
         let listener_clone = listener.clone();
+        
+        // Global limit (backpressure)
+        let global_permit = match global_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("proxy: dropped packet due to extreme global load");
+                continue;
+            }
+        };
+
+        // Per-IP limit (backpressure)
+        let ip = client_addr.ip();
+        let ip_semaphore = {
+            let mut limits = PER_IP_LIMITS.write().await;
+            limits.entry(ip).or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PER_IP))).clone()
+        };
 
         spawn(async move {
+            let _global_permit = global_permit;
+            let _ip_permit = ip_semaphore.acquire().await.ok();
+            
             let response = match forward_dns_query(&query, upstream_addr).await {
                 Ok(res) => res,
                 Err(err) => {

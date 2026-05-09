@@ -6,6 +6,8 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::spawn;
+use tokio::time::timeout;
+use std::time::Duration;
 
 use crate::state::{ManagedIpset, STATE};
 use crate::stats::{get_stats_report, register_network};
@@ -39,7 +41,9 @@ async fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Res
     let mut line = String::new();
     {
         let mut reader = BufReader::new(&mut stream);
-        reader.read_line(&mut line).await?;
+        if let Err(_) = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
+            return Err("control connection timed out waiting for command".into());
+        }
     }
 
     let command = line.trim_end_matches('\n');
