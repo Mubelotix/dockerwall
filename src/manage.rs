@@ -84,22 +84,6 @@ fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Result<()
 
     let command = line.trim_end_matches('\n');
 
-    if command == "RECORD" {
-        stream.write_all(b"OK\n")?;
-        let mut rx = crate::state::UNMATCHED_DOMAINS.subscribe();
-        loop {
-            match rx.blocking_recv() {
-                Ok(domain) => {
-                    if stream.write_all(format!("{domain}\n").as_bytes()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => continue, // Lagged or closed. Since the sender is LazyLock static, it won't be closed, but could lag
-            }
-        }
-        return Ok(());
-    }
-
     if command == "INFO" {
         stream.write_all(format!("OK\t{dns_port}\n").as_bytes())?;
         return Ok(());

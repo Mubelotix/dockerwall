@@ -27,8 +27,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: IpsetCommands,
     },
-    /// Stream unmanaged domains resolved by the proxy.
-    Record,
 }
 
 #[derive(Subcommand, Debug)]

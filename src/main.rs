@@ -5,7 +5,6 @@ mod manage;
 mod proxy;
 mod state;
 mod trust;
-mod record;
 
 use std::net::IpAddr;
 
@@ -37,7 +36,6 @@ fn main() {
             } => manage::send_create(&name, &allowed_domains),
             IpsetCommands::Remove { name } => manage::send_remove(&name),
         },
-        Commands::Record => record::stream_records(),
     };
 
     if let Err(err) = result {

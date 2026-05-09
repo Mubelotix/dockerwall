@@ -1,14 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::LazyLock;
-
-use tokio::sync::broadcast;
 use tokio::sync::RwLock;
-
-pub static UNMATCHED_DOMAINS: LazyLock<broadcast::Sender<String>> = LazyLock::new(|| {
-    let (tx, _) = broadcast::channel(1024);
-    tx
-});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedIpset {
@@ -26,14 +19,11 @@ pub async fn apply_resolved_ips(domains: &[String], resolved_ips: &[IpAddr]) -> 
     let mut changed_sets = Vec::new();
     let mut state = STATE.write().await;
 
-    let mut matched_domains = HashSet::new();
-
     for (name, managed_ipset) in state.iter_mut() {
         let mut matches_current_ipset = false;
         
         for domain in domains {
             if managed_ipset.allowed_domain_patterns.iter().any(|pattern| domain_matches_pattern(domain, pattern)) {
-                matched_domains.insert(domain.clone());
                 matches_current_ipset = true;
             }
         }
@@ -47,12 +37,6 @@ pub async fn apply_resolved_ips(domains: &[String], resolved_ips: &[IpAddr]) -> 
 
         if managed_ipset.ips.len() != before_len {
             changed_sets.push((name.clone(), managed_ipset.ips.iter().copied().collect()));
-        }
-    }
-
-    for domain in domains {
-        if !matched_domains.contains(domain) {
-            let _ = UNMATCHED_DOMAINS.send(domain.clone());
         }
     }
 
