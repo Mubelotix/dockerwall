@@ -9,6 +9,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Show DNS resolution statistics.
+    Stats,
     /// Run the daemon and open the local DNS proxy listener.
     Daemon {
         #[arg(long, default_value = "127.0.0.1:5353")]

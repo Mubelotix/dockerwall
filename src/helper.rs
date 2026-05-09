@@ -7,6 +7,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::runtime::Builder;
 
+use crate::control;
 use crate::manage;
 use crate::trust::is_trusted_binary;
 
@@ -19,7 +20,7 @@ const NETWORK_PREFIX_OCTET: u8 = 172;
 const NETWORK_PREFIX_LENGTH: u8 = 28;
 
 pub fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let dns_port = manage::get_dns_port()?;
+    let dns_port = control::get_dns_port()?;
     let runtime = Builder::new_current_thread().enable_io().build()?;
     let plan = NetworkPlan::new(name, dns_port);
 

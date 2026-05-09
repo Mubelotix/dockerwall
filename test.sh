@@ -35,16 +35,20 @@ sudo $DOCKERWALL prepare-network test-net "*.example.com"
 GW=$(docker network inspect test-net --format '{{(index .IPAM.Config 0).Gateway}}')
 
 # quick curl checks
-docker run --rm --network test-net curlimages/curl:latest -sS --max-time 10 http://example.com >/dev/null
+docker run --rm --network test-net --dns "$GW" curlimages/curl:latest -sS --max-time 10 http://example.com >/dev/null
 echo "example.com OK"
 
-if docker run --rm --network test-net curlimages/curl:latest -sS --max-time 10 http://google.com >/dev/null; then
+if docker run --rm --network test-net --dns "$GW" curlimages/curl:latest -sS --max-time 10 http://google.com >/dev/null; then
   echo "google.com reachable (FAIL)"
   EXIT_CODE=1
 else
   echo "google.com blocked as expected"
   EXIT_CODE=0
 fi
+
+echo "--- Statistics Report ---"
+sudo $DOCKERWALL stats
+echo "------------------------"
 
 # cleanup
 sudo pkill -9 dockerwall 2>/dev/null || true

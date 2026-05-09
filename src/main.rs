@@ -1,4 +1,6 @@
 mod cli;
+mod control;
+mod daemon;
 mod helper;
 mod ipset;
 mod manage;
@@ -16,6 +18,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Stats => stats::send_stats(),
         Commands::Daemon {
             dns_listen_addr,
             dns_upstream_addr,
@@ -27,7 +30,7 @@ fn main() {
 
             let stats_ttl = std::time::Duration::from_secs(stats_ttl);
 
-            manage::run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl)
+            daemon::run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl)
         }
         Commands::PrepareNetwork {
             name,
