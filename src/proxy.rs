@@ -77,16 +77,15 @@ async fn inspect_and_update_state(response: &[u8], origin: IpAddr, stats_ttl: Du
         Err(_) => return Ok(()),
     };
     let resolved_ips = collect_resolved_ips(&message);
-
-    if resolved_ips.is_empty() {
-        return Ok(());
-    }
-
     let mut domains = Vec::new();
     for query in &message.queries {
         let domain = query.name().to_utf8().trim_end_matches('.').to_ascii_lowercase();
         stats::record_resolve(&domain, origin, stats_ttl).await;
         domains.push(domain);
+    }
+
+    if resolved_ips.is_empty() {
+        return Ok(());
     }
 
     let changed_sets = state::apply_resolved_ips(&domains, &resolved_ips).await;

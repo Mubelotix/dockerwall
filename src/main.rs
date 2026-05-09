@@ -37,7 +37,7 @@ fn main() {
             IpsetCommands::Create {
                 name,
                 allowed_domains,
-            } => manage::send_create(&name, &allowed_domains),
+            } => manage::send_create(&name, None, &allowed_domains),
             IpsetCommands::Remove { name } => manage::send_remove(&name),
         },
     };

@@ -43,6 +43,15 @@ pub async fn apply_resolved_ips(domains: &[String], resolved_ips: &[IpAddr]) -> 
     changed_sets
 }
 
+pub async fn is_domain_accepted_by_network(domain: &str, network_name: &str) -> bool {
+    let state = STATE.read().await;
+    if let Some(managed_ipset) = state.get(network_name) {
+        return managed_ipset.allowed_domain_patterns.iter().any(|pattern| domain_matches_pattern(domain, pattern));
+    }
+    false
+}
+
+
 fn domain_matches_pattern(domain: &str, pattern: &str) -> bool {
     let domain = normalize_domain(domain);
     let pattern = normalize_domain(pattern);

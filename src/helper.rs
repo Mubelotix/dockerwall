@@ -24,7 +24,7 @@ pub fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box
     let plan = NetworkPlan::new(name, dns_port);
 
     runtime.block_on(setup_local_resources(&plan))?;
-    manage::send_create(name, domain_patterns)?;
+    manage::send_create(name, Some(&plan.subnet), domain_patterns)?;
 
     Ok(())
 }

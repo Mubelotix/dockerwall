@@ -28,8 +28,9 @@ pub fn run_daemon(
     }
 }
 
-pub fn send_create(name: &str, allowed_domains: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let payload = format!("CREATE\t{name}\t{}\n", allowed_domains.join(","));
+pub fn send_create(name: &str, subnet: Option<&str>, allowed_domains: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let subnet = subnet.unwrap_or("");
+    let payload = format!("CREATE\t{name}\t{subnet}\t{}\n", allowed_domains.join(","));
     send_control_command(&payload)?;
     println!("requested creation of ipset '{name}'");
     Ok(())
@@ -96,13 +97,18 @@ fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Result<()
     }
 
     if let Some(rest) = command.strip_prefix("CREATE\t") {
-        let mut parts = rest.splitn(2, '\t');
+        let mut parts = rest.splitn(3, '\t');
         let name = parts.next().ok_or("missing ipset name")?.trim();
+        let subnet = parts.next().ok_or("missing subnet")?.trim();
         let raw_domains = parts.next().ok_or("missing domains")?;
 
         if name.is_empty() {
             stream.write_all(b"ERR\tmissing ipset name\n")?;
             return Ok(());
+        }
+
+        if !subnet.is_empty() {
+            crate::stats::register_network(name.to_owned(), subnet.to_owned());
         }
 
         let allowed_domain_patterns: Vec<String> = raw_domains
