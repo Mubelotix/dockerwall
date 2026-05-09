@@ -4,6 +4,7 @@ mod ipset;
 mod manage;
 mod proxy;
 mod state;
+mod stats;
 mod trust;
 
 use std::net::IpAddr;
