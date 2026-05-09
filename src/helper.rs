@@ -95,16 +95,67 @@ async fn destroy_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + S
 }
 
 async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    run_command_checked(
+    let result = run_command_allow_failure(
         binary,
         [
             OsString::from("create"),
             OsString::from(name),
             OsString::from("hash:ip"),
+            OsString::from("maxelem"),
+            OsString::from("1000000000"),
             OsString::from("-exist"),
         ],
     )
     .await?;
+
+    if result.status.success() {
+        return Ok(());
+    }
+
+    // If it failed, it might be because the set exists with different parameters.
+    // We use a swap strategy to update it without removing iptables rules.
+    let tmp_name = format!("{}-tmp", name);
+    let _ = run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(&tmp_name)]).await;
+
+    run_command_checked(
+        binary,
+        [
+            OsString::from("create"),
+            OsString::from(&tmp_name),
+            OsString::from("hash:ip"),
+            OsString::from("maxelem"),
+            OsString::from("1000000000"),
+        ],
+    )
+    .await?;
+
+    // If the original set doesn't exist, we can't swap, so we just rename the tmp one.
+    let swap_result = run_command_allow_failure(
+        binary,
+        [
+            OsString::from("swap"),
+            OsString::from(name),
+            OsString::from(&tmp_name),
+        ],
+    )
+    .await?;
+
+    if swap_result.status.success() {
+        run_command_checked(binary, [OsString::from("destroy"), OsString::from(&tmp_name)]).await?;
+    } else {
+        // Swap failed, likely because 'name' doesn't exist? 
+        // Or some other error. Try to rename tmp to name if it doesn't exist.
+        run_command_checked(
+            binary,
+            [
+                OsString::from("rename"),
+                OsString::from(&tmp_name),
+                OsString::from(name),
+            ],
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
