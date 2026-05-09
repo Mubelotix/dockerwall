@@ -52,9 +52,30 @@ docker run --rm --network secure-net curlimages/curl:latest -sS --max-time 5 htt
 
 ## ⚙️ Architecture & Features
 
-- **Blazing Fast `ipset`:** Dockerwall uses batched `ipset restore` commands to rapidly inject allowed IP addresses without spawning excessive subprocesses or blocking DNS resolution.
-- **Asynchronous & Non-Blocking:** The transparent DNS proxy is built on a multi-threaded `tokio` async runtime, ensuring maximum throughput and immunity to network-level Denial-of-Service (DoS) attacks via delayed upstream resolvers.
-- **Zero Container Modification:** You do not need to pass custom `--dns` flags, modify `/etc/resolv.conf`, or configure HTTP proxies. Everything is enforced invisibly via gateway iptables rules.
+- **Massive Scalability:** Dockerwall uses high-performance `ipset` operations. This ensures that even large cloud provider IP ranges can be managed with no impact on network latency.
+- **Asynchronous & Non-Blocking:** Built on the `tokio` async runtime, the transparent DNS proxy handles queries concurrently for maximum throughput.
+- **Fairness & Isolation:** Dockerwall is designed to be robust under heavy load. It implements per-IP concurrency limits and asynchronous backpressure, ensuring that no single container can monopolize resources or affect the DNS resolution of others.
+- **Secure Management:** The control IPC interface is protected by strict Unix filesystem permissions (0600) and communication timeouts, ensuring a secure and reliable management plane.
+- **Zero Container Modification:** No custom `--dns` flags or `/etc/resolv.conf` changes are required. Traffic enforcement is handled transparently at the network gateway.
+
+## 📊 Monitoring & Statistics
+
+Dockerwall tracks every DNS resolution attempt across your managed networks. This allows you to audit which domains your containers are accessing (or attempting to access).
+
+To view the live statistics report:
+```bash
+sudo dockerwall stats
+```
+
+**Example Output:**
+```text
+Network: secure-net (172.30.113.0/28)
+  172.30.113.5    api.github.com                 12✅        5s ago
+  172.30.113.5    malicious.site                 3❌         1m ago
+```
+*(✅ indicates an allowed resolution that updated the ipset; ❌ indicates a blocked domain query).*
+
+Stats are stored in-memory with a configurable TTL (default 24h), which can be adjusted via the `--stats-ttl` flag when starting the daemon.
 
 ## 🛠️ Installation & Building
 
@@ -65,4 +86,4 @@ cargo build --release
 sudo cp target/release/dockerwall /usr/local/bin/
 ```
 
-*Note: Dockerwall requires root privileges to run, as it manages `iptables`, `ipset`, and creates Docker networks.*
+*Note: Dockerwall requires root privileges to manage `iptables`, `ipset`, and Docker networks.*
