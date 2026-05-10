@@ -182,7 +182,7 @@ pub async fn get_stats_report() -> String {
     unknown_ips.sort();
 
     if !unknown_ips.is_empty() {
-        report.push_str("Unknown Networks:\n");
+        report.push_str("Unknown Networks (created before the daemon was restarted — still fully functional, but with limited info):\n");
         for ip in unknown_ips {
             report.push_str(&format!("  IP: {}\n", ip));
             let entries = grouped_stats.get(&(None, ip)).unwrap();
