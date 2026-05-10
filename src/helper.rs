@@ -3,8 +3,10 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use tokio::process::Command;
+use tokio::time::sleep;
 
 use crate::control::get_dns_port;
 use crate::manage::send_create;
@@ -20,12 +22,24 @@ const NETWORK_PREFIX_LENGTH: u8 = 28;
 
 pub async fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
     let dns_port = get_dns_port().await?;
-    let plan = NetworkPlan::new(name, dns_port);
 
-    setup_local_resources(&plan).await?;
-    send_create(name, Some(&plan.subnet), domain_patterns).await?;
+    let mut last_err = None;
+    for attempt in 0u32..50 {
+        let plan = NetworkPlan::new(name, dns_port, attempt);
+        match setup_local_resources(&plan).await {
+            Ok(()) => {
+                send_create(name, Some(&plan.subnet), domain_patterns).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("network setup attempt {attempt} failed: {e}, retrying...");
+                last_err = Some(e);
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 
-    Ok(())
+    Err(last_err.unwrap_or_else(|| "failed to allocate network after 50 attempts".into()))
 }
 
 async fn setup_local_resources(plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -52,8 +66,8 @@ struct NetworkPlan {
 }
 
 impl NetworkPlan {
-    fn new(name: &str, dns_port: u16) -> Self {
-        let (subnet, gateway) = subnet_and_gateway(name);
+    fn new(name: &str, dns_port: u16, attempt: u32) -> Self {
+        let (subnet, gateway) = subnet_and_gateway(name, attempt);
         Self {
             name: name.to_owned(),
             subnet,
@@ -63,9 +77,10 @@ impl NetworkPlan {
     }
 }
 
-fn subnet_and_gateway(name: &str) -> (String, String) {
+fn subnet_and_gateway(name: &str, attempt: u32) -> (String, String) {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
+    attempt.hash(&mut hasher);
     let slot = (hasher.finish() % 4096) as u16;
     let third = (slot / 16) as u8;
     let fourth = (slot % 16) as u8;
