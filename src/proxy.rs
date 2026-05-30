@@ -42,6 +42,11 @@ pub async fn run_dns_proxy(
             }
         };
 
+        if !is_local_ip(client_addr.ip()) {
+            eprintln!("proxy: dropped packet from non-local IP: {}", client_addr.ip());
+            continue;
+        }
+
         let query = request_buf[..request_size].to_vec();
         let listener_clone = listener.clone();
         
@@ -81,6 +86,17 @@ pub async fn run_dns_proxy(
                 eprintln!("proxy send_to error: {err}");
             }
         });
+    }
+}
+
+fn is_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local()
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.is_unique_local() || ipv6.is_unicast_link_local()
+        }
     }
 }
 
