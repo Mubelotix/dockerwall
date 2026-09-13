@@ -123,7 +123,12 @@ if [ -n "$DAEMON_PID" ]; then
   sudo iptables -t nat -C PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
 fi
 
-podman run --rm --network "pasta:--outbound,$SOURCE_IP" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null
+if ! podman run --rm --network "pasta:--outbound,$SOURCE_IP" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null; then
+  sudo iptables -v -L OUTPUT -n --line-numbers
+  sudo iptables -v -L DOCKERWALL-OUTPUT -n --line-numbers
+  cat /tmp/dockerwall-rootless.log
+  exit 1
+fi
 echo "$ALLOWED_DOMAIN OK"
 
 if podman run --rm --network "pasta:--outbound,$SOURCE_IP" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$BLOCKED_DOMAIN" >/dev/null; then
