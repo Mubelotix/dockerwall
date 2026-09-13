@@ -37,6 +37,8 @@ cleanup() {
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:established" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p udp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-udp" -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p tcp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-tcp" -j ACCEPT
+    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d "$source_cidr" -p udp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-udp" -j ACCEPT
+    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d "$source_cidr" -p tcp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-tcp" -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:allow" -m set --match-set "$NETWORK" dst -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:drop" -j DROP
     sudo ip addr del "$source_cidr" dev "$OUTBOUND_INTERFACE" >/dev/null 2>&1 || true
@@ -68,7 +70,8 @@ if [ -S "$CONTROL_SOCKET" ]; then
   exit 1
 fi
 
-sudo "$DOCKERWALL" daemon --dns-listen-addr "127.0.0.1:$DNS_PORT" >/tmp/dockerwall-rootless.log 2>&1 &
+# Match the system daemon's wildcard listener, which selects the Pasta source IP for replies.
+sudo "$DOCKERWALL" daemon --dns-listen-addr "0.0.0.0:$DNS_PORT" >/tmp/dockerwall-rootless.log 2>&1 &
 DAEMON_PID=$!
 
 for _ in {1..10}; do
