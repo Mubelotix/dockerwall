@@ -856,6 +856,35 @@ async fn ensure_rootless_dns_redirects(
         )
         .await?;
     }
+    for protocol in ["udp", "tcp"] {
+        ensure_rule_present(
+            binary,
+            &[
+                OsString::from("-t"),
+                OsString::from("nat"),
+                OsString::from("-I"),
+                OsString::from("POSTROUTING"),
+                OsString::from("1"),
+                OsString::from("-s"),
+                OsString::from(source_cidr),
+                OsString::from("-d"),
+                OsString::from(source_cidr),
+                OsString::from("-p"),
+                OsString::from(protocol),
+                OsString::from("--sport"),
+                OsString::from(dns_port.to_string()),
+                OsString::from("-m"),
+                OsString::from("comment"),
+                OsString::from("--comment"),
+                OsString::from(format!("dockerwall:{name}:dns-response-snat-{protocol}")),
+                OsString::from("-j"),
+                OsString::from("SNAT"),
+                OsString::from("--to-source"),
+                OsString::from("127.0.0.1"),
+            ],
+        )
+        .await?;
+    }
     Ok(())
 }
 
