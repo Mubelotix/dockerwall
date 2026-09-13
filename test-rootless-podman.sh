@@ -15,6 +15,7 @@ DAEMON_PID=""
 SOURCE_IP=""
 OUTBOUND_INTERFACE=""
 DNS_IP="198.18.0.1"
+DNS_PORT="5353"
 DNS_ALIAS_WAS_PRESENT=true
 OUTPUT_CHAIN_WAS_PRESENT=true
 
@@ -28,9 +29,14 @@ cleanup() {
   if [ -n "$SOURCE_IP" ] && [ -n "$OUTBOUND_INTERFACE" ]; then
     local source_cidr="$SOURCE_IP/32"
     remove_rule -t nat -D POSTROUTING -s "$source_cidr" -o "$OUTBOUND_INTERFACE" -m comment --comment "dockerwall:$NETWORK:masquerade" -j MASQUERADE
+    remove_rule -t nat -D OUTPUT -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-OUTPUT-udp" -j REDIRECT --to-ports "$DNS_PORT"
+    remove_rule -t nat -D OUTPUT -s "$source_cidr" -d "$DNS_IP/32" -p tcp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-OUTPUT-tcp" -j REDIRECT --to-ports "$DNS_PORT"
+    remove_rule -t nat -D PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
+    remove_rule -t nat -D PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p tcp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-tcp" -j REDIRECT --to-ports "$DNS_PORT"
     remove_rule -D OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:output-hook" -j DOCKERWALL-OUTPUT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:established" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d "$DNS_IP" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns" -j ACCEPT
+    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p udp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-udp" -j ACCEPT
+    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p tcp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-tcp" -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:allow" -m set --match-set "$NETWORK" dst -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:drop" -j DROP
     sudo ip addr del "$source_cidr" dev "$OUTBOUND_INTERFACE" >/dev/null 2>&1 || true
@@ -93,6 +99,12 @@ if [[ "$PREPARE_OUTPUT" =~ rootless[[:space:]]Podman[[:space:]]interface:[[:spac
 else
   echo "prepare-network did not report the outbound interface"
   exit 1
+fi
+
+if [ -n "$DAEMON_PID" ]; then
+  source_cidr="$SOURCE_IP/32"
+  sudo iptables -t nat -C OUTPUT -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-OUTPUT-udp" -j REDIRECT --to-ports "$DNS_PORT"
+  sudo iptables -t nat -C PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
 fi
 
 podman run --rm --network "pasta:--outbound,$SOURCE_IP" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null

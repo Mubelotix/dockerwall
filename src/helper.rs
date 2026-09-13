@@ -21,7 +21,7 @@ const IP_CANDIDATES: [&str; 3] = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"];
 const PODMAN_OUTPUT_CHAIN: &str = "DOCKERWALL-OUTPUT";
 const ROOTLESS_DNS_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const ROOTLESS_DNS_CIDR: &str = "198.18.0.1/32";
-const ROOTLESS_DNS_LISTEN_ADDR: &str = "198.18.0.1:53";
+const ROOTLESS_DNS_REDIRECT_CIDR: &str = "127.0.0.1/32";
 
 const NETWORK_BASE_OCTET: u8 = 30;
 const NETWORK_PREFIX_OCTET: u8 = 172;
@@ -84,7 +84,7 @@ async fn prepare_rootless_podman_network(
 
     let ip_binary = resolve_binary(&IP_CANDIDATES).await?;
     ensure_rootless_dns_alias(ip_binary).await?;
-    ensure_rootless_dns_daemon().await?;
+    let dns_port = ensure_rootless_dns_daemon().await?;
 
     let interface = match requested_interface {
         Some(interface) => validate_interface_name(interface)?.to_owned(),
@@ -108,7 +108,7 @@ async fn prepare_rootless_podman_network(
     .await?;
     destroy_ipset(ipset_binary, name).await?;
     create_ipset(ipset_binary, name).await?;
-    ensure_rootless_podman_rules(iptables_binary, name, &source_cidr, &interface).await?;
+    ensure_rootless_podman_rules(iptables_binary, name, &source_cidr, &interface, dns_port).await?;
     send_create(name, Some(&source_cidr), domain_patterns).await?;
 
     println!("rootless Podman source IP: {source_ip}");
@@ -134,15 +134,9 @@ async fn ensure_rootless_dns_alias(ip_binary: &str) -> Result<(), Box<dyn Error 
     Ok(())
 }
 
-async fn ensure_rootless_dns_daemon() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn ensure_rootless_dns_daemon() -> Result<u16, Box<dyn Error + Send + Sync>> {
     match get_dns_port().await {
-        Ok(53) => return Ok(()),
-        Ok(port) => {
-            return Err(format!(
-                "rootless Podman requires the host Dockerwall daemon to listen on port 53 (found {port})"
-            )
-            .into());
-        }
+        Ok(port) => return Ok(port),
         Err(_) => {}
     }
 
@@ -154,7 +148,7 @@ async fn ensure_rootless_dns_daemon() -> Result<(), Box<dyn Error + Send + Sync>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(false)
-        .args(["daemon", "--dns-listen-addr", ROOTLESS_DNS_LISTEN_ADDR])
+        .args(["daemon"])
         .spawn()?;
     let pid = child
         .id()
@@ -163,13 +157,7 @@ async fn ensure_rootless_dns_daemon() -> Result<(), Box<dyn Error + Send + Sync>
 
     for _ in 0..50 {
         match get_dns_port().await {
-            Ok(53) => return Ok(()),
-            Ok(port) => {
-                return Err(format!(
-                    "rootless Podman requires the host Dockerwall daemon to listen on port 53 (found {port})"
-                )
-                .into());
-            }
+            Ok(port) => return Ok(port),
             Err(_) => sleep(Duration::from_millis(100)).await,
         }
     }
@@ -253,7 +241,11 @@ async fn allocate_rootless_podman_source_ip(
     ip_binary: &str,
     name: &str,
 ) -> Result<Ipv4Addr, Box<dyn Error + Send + Sync>> {
-    let output = run_command_checked(iptables_binary, [OsString::from("-S"), OsString::from("OUTPUT")]).await?;
+    let output = run_command_checked(
+        iptables_binary,
+        [OsString::from("-S"), OsString::from("OUTPUT")],
+    )
+    .await?;
     let rules = String::from_utf8_lossy(&output.stdout);
     let own_marker = format!("dockerwall:{name}:output-hook");
 
@@ -621,8 +613,14 @@ async fn ensure_rootless_podman_rules(
     name: &str,
     source_cidr: &str,
     interface: &str,
+    dns_port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     ensure_chain(binary, PODMAN_OUTPUT_CHAIN).await?;
+    let dns_destination = if dns_port == 53 {
+        ROOTLESS_DNS_CIDR
+    } else {
+        ROOTLESS_DNS_REDIRECT_CIDR
+    };
     ensure_rule_present(
         binary,
         &[
@@ -670,15 +668,15 @@ async fn ensure_rootless_podman_rules(
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-d"),
-            OsString::from(ROOTLESS_DNS_CIDR),
+            OsString::from(dns_destination),
             OsString::from("-p"),
             OsString::from("udp"),
             OsString::from("--dport"),
-            OsString::from("53"),
+            OsString::from(dns_port.to_string()),
             OsString::from("-m"),
             OsString::from("comment"),
             OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{name}:dns")),
+            OsString::from(format!("dockerwall:{name}:dns-udp")),
             OsString::from("-j"),
             OsString::from("ACCEPT"),
         ],
@@ -690,6 +688,29 @@ async fn ensure_rootless_podman_rules(
             OsString::from("-I"),
             OsString::from(PODMAN_OUTPUT_CHAIN),
             OsString::from("3"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-d"),
+            OsString::from(dns_destination),
+            OsString::from("-p"),
+            OsString::from("tcp"),
+            OsString::from("--dport"),
+            OsString::from(dns_port.to_string()),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:dns-tcp")),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("4"),
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-m"),
@@ -711,7 +732,7 @@ async fn ensure_rootless_podman_rules(
         &[
             OsString::from("-I"),
             OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("4"),
+            OsString::from("5"),
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-m"),
@@ -723,6 +744,9 @@ async fn ensure_rootless_podman_rules(
         ],
     )
     .await?;
+    if dns_port != 53 {
+        ensure_rootless_dns_redirects(binary, name, source_cidr, dns_port).await?;
+    }
     ensure_rule_present(
         binary,
         &[
@@ -744,6 +768,49 @@ async fn ensure_rootless_podman_rules(
         ],
     )
     .await
+}
+
+async fn ensure_rootless_dns_redirects(
+    binary: &str,
+    name: &str,
+    source_cidr: &str,
+    dns_port: u16,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for (chain, protocol) in [
+        ("OUTPUT", "udp"),
+        ("OUTPUT", "tcp"),
+        ("PREROUTING", "udp"),
+        ("PREROUTING", "tcp"),
+    ] {
+        ensure_rule_present(
+            binary,
+            &[
+                OsString::from("-t"),
+                OsString::from("nat"),
+                OsString::from("-I"),
+                OsString::from(chain),
+                OsString::from("1"),
+                OsString::from("-s"),
+                OsString::from(source_cidr),
+                OsString::from("-d"),
+                OsString::from(ROOTLESS_DNS_CIDR),
+                OsString::from("-p"),
+                OsString::from(protocol),
+                OsString::from("--dport"),
+                OsString::from("53"),
+                OsString::from("-m"),
+                OsString::from("comment"),
+                OsString::from("--comment"),
+                OsString::from(format!("dockerwall:{name}:dns-{chain}-{protocol}")),
+                OsString::from("-j"),
+                OsString::from("REDIRECT"),
+                OsString::from("--to-ports"),
+                OsString::from(dns_port.to_string()),
+            ],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn ensure_chain(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
