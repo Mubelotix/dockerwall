@@ -15,7 +15,7 @@ DAEMON_PID=""
 SOURCE_IP=""
 OUTBOUND_INTERFACE=""
 DNS_IP="198.18.0.1"
-DNS_PORT="5353"
+DNS_PORT="5354"
 DNS_ALIAS_WAS_PRESENT=true
 OUTPUT_CHAIN_WAS_PRESENT=true
 
@@ -63,6 +63,22 @@ if [ "$(podman info --format '{{.Host.Security.Rootless}}')" != true ]; then
   exit 1
 fi
 
+if [ -S "$CONTROL_SOCKET" ]; then
+  echo "this test requires no existing Dockerwall daemon"
+  exit 1
+fi
+
+sudo "$DOCKERWALL" daemon --dns-listen-addr "127.0.0.1:$DNS_PORT" >/tmp/dockerwall-rootless.log 2>&1 &
+DAEMON_PID=$!
+
+for _ in {1..10}; do
+  [ -S "$CONTROL_SOCKET" ] && break || sleep 1
+done
+if [ ! -S "$CONTROL_SOCKET" ]; then
+  echo "daemon control socket not available"
+  exit 1
+fi
+
 if [[ "$(sudo ip -o -4 addr show dev lo)" == *"$DNS_IP/32"* ]]; then
   DNS_ALIAS_WAS_PRESENT=true
 else
@@ -80,9 +96,6 @@ PREPARE_OUTPUT="$(sudo "$DOCKERWALL" prepare-network --runtime podman "$NETWORK"
 PREPARE_STATUS=$?
 set -e
 printf '%s\n' "$PREPARE_OUTPUT"
-if [[ "$PREPARE_OUTPUT" =~ started[[:space:]]external[[:space:]]host[[:space:]]Dockerwall[[:space:]]daemon[[:space:]]\(pid[[:space:]]([0-9]+)\) ]]; then
-  DAEMON_PID="${BASH_REMATCH[1]}"
-fi
 if [ "$PREPARE_STATUS" -ne 0 ]; then
   echo "prepare-network failed"
   exit 1
