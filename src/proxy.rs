@@ -92,7 +92,10 @@ pub async fn run_dns_proxy(
 fn is_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
-            ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local()
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || (ipv4.octets()[0] == 198 && matches!(ipv4.octets()[1], 18 | 19))
         }
         IpAddr::V6(ipv6) => {
             ipv6.is_loopback() || ipv6.is_unique_local() || ipv6.is_unicast_link_local()

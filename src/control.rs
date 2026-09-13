@@ -131,12 +131,16 @@ pub async fn send_control_command(payload: &str) -> Result<(), Box<dyn Error + S
 }
 
 pub async fn get_dns_port() -> Result<u16, Box<dyn Error + Send + Sync>> {
-    let mut stream = UnixStream::connect(CONTROL_SOCKET_PATH).await?;
+    let mut stream = timeout(
+        Duration::from_secs(1),
+        UnixStream::connect(CONTROL_SOCKET_PATH),
+    )
+    .await??;
     stream.write_all(b"INFO\n").await?;
 
     let mut response = String::new();
     let mut reader = BufReader::new(stream);
-    reader.read_line(&mut response).await?;
+    timeout(Duration::from_secs(1), reader.read_line(&mut response)).await??;
 
     if let Some(rest) = response.strip_prefix("OK\t") {
         let port: u16 = rest.trim_end().parse()?;

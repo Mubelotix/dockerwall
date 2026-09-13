@@ -1,8 +1,8 @@
 # 🧱 Dockerwall
 
-**Zero-trust outbound firewalling for Docker containers, powered by transparent DNS inspection.**
+**Zero-trust outbound firewalling for Docker and Podman containers, powered by transparent DNS inspection.**
 
-Dockerwall is a security daemon that tightly controls outbound traffic from your Docker containers. Instead of manually maintaining brittle lists of IP addresses or configuring complex HTTP proxies, Dockerwall lets you specify **allowed domains**. It transparently intercepts container DNS queries, dynamically adds resolved IP addresses to an allowed `ipset`, and drops all other outbound traffic at the network level.
+Dockerwall is a security daemon that tightly controls outbound traffic from your containers. Instead of manually maintaining brittle lists of IP addresses or configuring complex HTTP proxies, Dockerwall lets you specify **allowed domains**. It transparently intercepts container DNS queries, dynamically adds resolved IP addresses to an allowed `ipset`, and drops all other outbound traffic at the network level.
 
 If your container gets compromised, the attacker cannot exfiltrate data to unauthorized servers, download external payloads, or pivot to unapproved external infrastructure.
 
@@ -25,28 +25,46 @@ Here is a full example of locking down a container so it can *only* communicate 
 ### 1. Start the Daemon
 Start the Dockerwall daemon in the background. It will listen for IPC commands and manage the local DNS proxy.
 ```bash
-sudo dockerwall daemon &
+sudo dockerwall daemon --dns-listen-addr 0.0.0.0:5353 &
 ```
 
 ### 2. Prepare a Secure Network
-Ask Dockerwall to create a secure Docker network named `secure-net` and restrict it strictly to `*.example.com`.
+Ask Dockerwall to create a secure network named `secure-net` and restrict it strictly to `*.example.com`.
 ```bash
 sudo dockerwall prepare-network secure-net "*.example.com"
 ```
-*(Under the hood, Dockerwall creates the bridge network, establishes the iptables DROP/ACCEPT rules, creates the ipset, and sets up transparent DNS rerouting).*
+*(Under the hood, Dockerwall creates the bridge network, establishes the iptables DROP/ACCEPT rules, creates the ipset, and sets up transparent DNS rerouting.)*
+
+### Rootless Podman With Pasta
+
+Rootless Podman uses host-root Dockerwall policy resources. Preparing the logical policy name reserves the host-only `198.18.0.1/32` alias on `lo` and starts an external host daemon when no responsive control socket exists:
+```bash
+sudo dockerwall prepare-network --runtime podman secure-net "*.example.com"
+# prepare-network prints the deterministic source IP and this invocation:
+podman run --rm --network pasta:--outbound,<source-ip> --dns 198.18.0.1 docker.io/curlimages/curl:latest --ipv4 -sS --max-time 5 http://example.com
+```
+
+`prepare-network` requires host root. If a daemon already owns `/run/dockerwall.sock`, it must report DNS port 53; otherwise Dockerwall starts a detached host daemon bound exactly to `198.18.0.1:53` and waits for its control socket. Dockerwall never enters a Podman or container namespace. It derives the outbound interface from the default route, or accepts `--interface <name>` when that route is unsuitable. The logical policy name is not a Podman bridge network. Dockerwall assigns its deterministic `198.18.0.0/15` source `/32` to that host interface, excluding the fixed DNS alias, then prints the matching `pasta:--outbound` and `--dns` arguments.
+
+The host needs rootless Podman with pasta, `ip`, `ipset`, and `iptables`. DNS reaches the host daemon at `198.18.0.1` while pasta keeps the per-policy source alias for outbound traffic.
+
+Run the rootless end-to-end test with:
+```bash
+./test-rootless-podman.sh
+```
 
 ### 3. Run Your Containers
 Attach any unmodified container to the network. It will transparently be secured.
 
 **Allowed Traffic:**
 ```bash
-docker run --rm --network secure-net curlimages/curl:latest -sS --max-time 5 http://example.com
+docker run --rm --network secure-net docker.io/curlimages/curl:latest -sS --max-time 5 http://example.com
 # ✅ Success! The DNS was inspected and the IP was dynamically allowed.
 ```
 
 **Blocked Traffic:**
 ```bash
-docker run --rm --network secure-net curlimages/curl:latest -sS --max-time 5 http://google.com
+docker run --rm --network secure-net docker.io/curlimages/curl:latest -sS --max-time 5 http://google.com
 # ❌ Blocked! The connection will time out because it's dropped at the network layer.
 ```
 
@@ -56,7 +74,7 @@ docker run --rm --network secure-net curlimages/curl:latest -sS --max-time 5 htt
 - **Asynchronous & Non-Blocking:** Built on the `tokio` async runtime, the transparent DNS proxy handles queries concurrently for maximum throughput.
 - **Fairness & Isolation:** Dockerwall is designed to be robust under heavy load. It implements per-IP concurrency limits and asynchronous backpressure, ensuring that no single container can monopolize resources or affect the DNS resolution of others.
 - **Secure Management:** The control IPC interface is protected by strict Unix filesystem permissions (0600) and communication timeouts, ensuring a secure and reliable management plane.
-- **Zero Container Modification:** No custom `--dns` flags or `/etc/resolv.conf` changes are required. Traffic enforcement is handled transparently at the network gateway.
+- **Zero Container Modification:** Docker networks are configured transparently; rootless Podman pasta containers use the printed `--dns` and `--network` arguments.
 
 ## 📊 Monitoring & Statistics
 
@@ -86,4 +104,4 @@ cargo build --release
 sudo cp target/release/dockerwall /usr/local/bin/
 ```
 
-*Note: Dockerwall requires root privileges to manage `iptables`, `ipset`, and Docker networks.*
+Dockerwall requires root privileges to manage host `iptables`, `ipset`, and network resources.

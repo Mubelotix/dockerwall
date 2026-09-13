@@ -2,12 +2,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
+use std::net::Ipv4Addr;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::cli::ContainerRuntime;
 use crate::control::get_dns_port;
 use crate::manage::send_create;
 use crate::trust::is_trusted_binary;
@@ -15,25 +17,56 @@ use crate::trust::is_trusted_binary;
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
 const DOCKER_CANDIDATES: [&str; 3] = ["/usr/bin/docker", "/bin/docker", "/usr/local/bin/docker"];
 const IPTABLES_CANDIDATES: [&str; 2] = ["/usr/sbin/iptables", "/sbin/iptables"];
+const IP_CANDIDATES: [&str; 3] = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"];
+const PODMAN_OUTPUT_CHAIN: &str = "DOCKERWALL-OUTPUT";
+const ROOTLESS_DNS_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+const ROOTLESS_DNS_CIDR: &str = "198.18.0.1/32";
+const ROOTLESS_DNS_LISTEN_ADDR: &str = "198.18.0.1:53";
 
 const NETWORK_BASE_OCTET: u8 = 30;
 const NETWORK_PREFIX_OCTET: u8 = 172;
 const NETWORK_PREFIX_LENGTH: u8 = 28;
+const USABLE_HOSTS_PER_SUBNET: u16 = 14;
+const SUBNET_SLOTS: u64 = 256 * USABLE_HOSTS_PER_SUBNET as u64;
 
-pub async fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn prepare_network(
+    name: &str,
+    domain_patterns: &[String],
+    runtime: ContainerRuntime,
+    interface: Option<&str>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match runtime {
+        ContainerRuntime::Docker => {
+            if interface.is_some() {
+                return Err("--interface is only valid with --runtime podman".into());
+            }
+            prepare_docker_network(name, domain_patterns).await
+        }
+        // Podman uses pasta in the calling user's rootless session. Dockerwall
+        // configures only host resources and never enters that user namespace.
+        ContainerRuntime::Podman => {
+            prepare_rootless_podman_network(name, domain_patterns, interface).await
+        }
+    }
+}
+
+async fn prepare_docker_network(
+    name: &str,
+    domain_patterns: &[String],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let dns_port = get_dns_port().await?;
 
     let mut last_err = None;
     for attempt in 0u32..50 {
         let plan = NetworkPlan::new(name, dns_port, attempt);
-        match setup_local_resources(&plan).await {
+        match setup_docker_resources(&plan).await {
             Ok(()) => {
                 send_create(name, Some(&plan.subnet), domain_patterns).await?;
                 return Ok(());
             }
-            Err(e) => {
-                eprintln!("network setup attempt {attempt} failed: {e}, retrying...");
-                last_err = Some(e);
+            Err(err) => {
+                eprintln!("network setup attempt {attempt} failed: {err}, retrying...");
+                last_err = Some(err);
                 sleep(Duration::from_millis(100)).await;
             }
         }
@@ -42,21 +75,257 @@ pub async fn prepare_network(name: &str, domain_patterns: &[String]) -> Result<(
     Err(last_err.unwrap_or_else(|| "failed to allocate network after 50 attempts".into()))
 }
 
-async fn setup_local_resources(plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn prepare_rootless_podman_network(
+    name: &str,
+    domain_patterns: &[String],
+    requested_interface: Option<&str>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ensure_host_root()?;
+
+    let ip_binary = resolve_binary(&IP_CANDIDATES).await?;
+    ensure_rootless_dns_alias(ip_binary).await?;
+    ensure_rootless_dns_daemon().await?;
+
+    let interface = match requested_interface {
+        Some(interface) => validate_interface_name(interface)?.to_owned(),
+        None => default_route_interface().await?,
+    };
+    let ipset_binary = resolve_binary(&IPSET_CANDIDATES).await?;
+    let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES).await?;
+    let source_ip = allocate_rootless_podman_source_ip(iptables_binary, ip_binary, name).await?;
+    let source_cidr = format!("{source_ip}/32");
+
+    run_command_checked(
+        ip_binary,
+        [
+            OsString::from("addr"),
+            OsString::from("replace"),
+            OsString::from(&source_cidr),
+            OsString::from("dev"),
+            OsString::from(&interface),
+        ],
+    )
+    .await?;
+    destroy_ipset(ipset_binary, name).await?;
+    create_ipset(ipset_binary, name).await?;
+    ensure_rootless_podman_rules(iptables_binary, name, &source_cidr, &interface).await?;
+    send_create(name, Some(&source_cidr), domain_patterns).await?;
+
+    println!("rootless Podman source IP: {source_ip}");
+    println!("rootless Podman interface: {interface}");
+    println!(
+        "podman run --network pasta:--outbound,{source_ip} --dns {ROOTLESS_DNS_IP} <image> <command>"
+    );
+    Ok(())
+}
+
+async fn ensure_rootless_dns_alias(ip_binary: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_command_checked(
+        ip_binary,
+        [
+            OsString::from("addr"),
+            OsString::from("replace"),
+            OsString::from(ROOTLESS_DNS_CIDR),
+            OsString::from("dev"),
+            OsString::from("lo"),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn ensure_rootless_dns_daemon() -> Result<(), Box<dyn Error + Send + Sync>> {
+    match get_dns_port().await {
+        Ok(53) => return Ok(()),
+        Ok(port) => {
+            return Err(format!(
+                "rootless Podman requires the host Dockerwall daemon to listen on port 53 (found {port})"
+            )
+            .into());
+        }
+        Err(_) => {}
+    }
+
+    let executable = std::env::current_exe()?;
+    let child = Command::new(executable)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false)
+        .args(["daemon", "--dns-listen-addr", ROOTLESS_DNS_LISTEN_ADDR])
+        .spawn()?;
+    let pid = child
+        .id()
+        .ok_or("could not determine external daemon PID")?;
+    println!("started external host Dockerwall daemon (pid {pid})");
+
+    for _ in 0..50 {
+        match get_dns_port().await {
+            Ok(53) => return Ok(()),
+            Ok(port) => {
+                return Err(format!(
+                    "rootless Podman requires the host Dockerwall daemon to listen on port 53 (found {port})"
+                )
+                .into());
+            }
+            Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+
+    Err("external host Dockerwall daemon did not become ready".into())
+}
+
+fn ensure_host_root() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let uid_line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or("could not determine effective UID")?;
+    let effective_uid = uid_line
+        .split_whitespace()
+        .nth(2)
+        .ok_or("could not determine effective UID")?;
+    if effective_uid != "0" {
+        return Err("rootless Podman preparation must run as host root".into());
+    }
+
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map")?;
+    let host_uid = uid_map
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or("could not determine host UID mapping")?;
+    if host_uid != "0" {
+        return Err(
+            "rootless Podman preparation must run as host root, not a user namespace root".into(),
+        );
+    }
+    Ok(())
+}
+
+async fn default_route_interface() -> Result<String, Box<dyn Error + Send + Sync>> {
+    let ip_binary = resolve_binary(&IP_CANDIDATES).await?;
+    let output = run_command_checked(
+        ip_binary,
+        [
+            OsString::from("route"),
+            OsString::from("show"),
+            OsString::from("default"),
+        ],
+    )
+    .await?;
+    let output = String::from_utf8_lossy(&output.stdout);
+
+    for route in output.lines() {
+        let mut fields = route.split_ascii_whitespace();
+        if fields.next() != Some("default") {
+            continue;
+        }
+        while let Some(field) = fields.next() {
+            if field == "dev" {
+                let interface = fields.next().ok_or("default route has no interface")?;
+                return Ok(validate_interface_name(interface)?.to_owned());
+            }
+        }
+    }
+
+    Err("could not determine the default-route interface".into())
+}
+
+fn validate_interface_name(interface: &str) -> Result<&str, Box<dyn Error + Send + Sync>> {
+    if interface.is_empty()
+        || interface.len() > 15
+        || !interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "interface name must be 1-15 ASCII alphanumeric, '.', '_', or '-' characters".into(),
+        );
+    }
+    Ok(interface)
+}
+
+async fn allocate_rootless_podman_source_ip(
+    iptables_binary: &str,
+    ip_binary: &str,
+    name: &str,
+) -> Result<Ipv4Addr, Box<dyn Error + Send + Sync>> {
+    let output = run_command_checked(iptables_binary, [OsString::from("-S"), OsString::from("OUTPUT")]).await?;
+    let rules = String::from_utf8_lossy(&output.stdout);
+    let own_marker = format!("dockerwall:{name}:output-hook");
+
+    for line in rules.lines() {
+        if line.contains(&own_marker) {
+            if let Some(source_ip) = output_rule_source_ip(line) {
+                return Ok(source_ip);
+            }
+        }
+    }
+
+    for attempt in 0..131_069 {
+        let source_ip = rootless_podman_source_ip(name, attempt);
+        let source_cidr = format!("{source_ip}/32");
+        if rules.lines().any(|line| line.contains(&source_cidr)) {
+            continue;
+        }
+
+        let output = run_command_checked(
+            ip_binary,
+            [
+                OsString::from("-o"),
+                OsString::from("-4"),
+                OsString::from("addr"),
+                OsString::from("show"),
+                OsString::from("to"),
+                OsString::from(&source_cidr),
+            ],
+        )
+        .await?;
+        if output.stdout.is_empty() {
+            return Ok(source_ip);
+        }
+    }
+
+    Err("all managed rootless Podman source addresses are in use".into())
+}
+
+fn output_rule_source_ip(rule: &str) -> Option<Ipv4Addr> {
+    let mut fields = rule.split_ascii_whitespace();
+    while let Some(field) = fields.next() {
+        if field == "-s" {
+            return fields.next()?.strip_suffix("/32")?.parse().ok();
+        }
+    }
+    None
+}
+
+fn rootless_podman_source_ip(name: &str, attempt: u32) -> Ipv4Addr {
+    // FNV-1a is stable across processes and releases, unlike a randomized map hasher.
+    let hash = name
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    let offset = ((hash % 131_069) as u32 + attempt) % 131_069 + 2;
+    let base = u32::from(Ipv4Addr::new(198, 18, 0, 0));
+    Ipv4Addr::from(base + offset)
+}
+
+async fn setup_docker_resources(plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ipset_binary = resolve_binary(&IPSET_CANDIDATES).await?;
     let docker_binary = resolve_binary(&DOCKER_CANDIDATES).await?;
     let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES).await?;
 
     destroy_ipset(ipset_binary, &plan.name).await?;
     create_ipset(ipset_binary, &plan.name).await?;
-
     remove_docker_network(docker_binary, &plan.name).await?;
     create_docker_network(docker_binary, plan).await?;
-
-    ensure_iptables_rules(iptables_binary, plan).await?;
-    Ok(())
+    ensure_docker_iptables_rules(iptables_binary, plan).await
 }
-
 
 struct NetworkPlan {
     name: String,
@@ -81,31 +350,33 @@ fn subnet_and_gateway(name: &str, attempt: u32) -> (String, String) {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
     attempt.hash(&mut hasher);
-    let slot = (hasher.finish() % 4096) as u16;
-    let third = (slot / 16) as u8;
-    let fourth = (slot % 16) as u8;
+    let slot = (hasher.finish() % SUBNET_SLOTS) as u16;
+    let third = (slot / USABLE_HOSTS_PER_SUBNET) as u8;
+    let fourth = (slot % USABLE_HOSTS_PER_SUBNET) as u8;
 
-    let subnet = format!(
-        "{}.{}.{}.0/{NETWORK_PREFIX_LENGTH}",
-        NETWORK_PREFIX_OCTET, NETWORK_BASE_OCTET, third
+    let subnet =
+        format!("{NETWORK_PREFIX_OCTET}.{NETWORK_BASE_OCTET}.{third}.0/{NETWORK_PREFIX_LENGTH}");
+    let gateway = format!(
+        "{NETWORK_PREFIX_OCTET}.{NETWORK_BASE_OCTET}.{third}.{}",
+        fourth + 1
     );
-    let gateway = format!("{}.{}.{}.{}", NETWORK_PREFIX_OCTET, NETWORK_BASE_OCTET, third, fourth + 1);
-
     (subnet, gateway)
 }
 
-async fn resolve_binary(candidates: &'static [&'static str]) -> Result<&'static str, Box<dyn Error + Send + Sync>> {
+async fn resolve_binary(
+    candidates: &'static [&'static str],
+) -> Result<&'static str, Box<dyn Error + Send + Sync>> {
     for candidate in candidates {
         if is_trusted_binary(candidate).await? {
             return Ok(candidate);
         }
     }
-
     Err("trusted binary not found".into())
 }
 
 async fn destroy_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let _ = run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(name)]).await;
+    let _ =
+        run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(name)]).await;
     Ok(())
 }
 
@@ -122,16 +393,16 @@ async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Se
         ],
     )
     .await?;
-
     if result.status.success() {
         return Ok(());
     }
 
-    // If it failed, it might be because the set exists with different parameters.
-    // We use a swap strategy to update it without removing iptables rules.
-    let tmp_name = format!("{}-tmp", name);
-    let _ = run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(&tmp_name)]).await;
-
+    let tmp_name = format!("{name}-tmp");
+    let _ = run_command_allow_failure(
+        binary,
+        [OsString::from("destroy"), OsString::from(&tmp_name)],
+    )
+    .await;
     run_command_checked(
         binary,
         [
@@ -144,7 +415,6 @@ async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Se
     )
     .await?;
 
-    // If the original set doesn't exist, we can't swap, so we just rename the tmp one.
     let swap_result = run_command_allow_failure(
         binary,
         [
@@ -154,12 +424,13 @@ async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Se
         ],
     )
     .await?;
-
     if swap_result.status.success() {
-        run_command_checked(binary, [OsString::from("destroy"), OsString::from(&tmp_name)]).await?;
+        run_command_checked(
+            binary,
+            [OsString::from("destroy"), OsString::from(&tmp_name)],
+        )
+        .await?;
     } else {
-        // Swap failed, likely because 'name' doesn't exist? 
-        // Or some other error. Try to rename tmp to name if it doesn't exist.
         run_command_checked(
             binary,
             [
@@ -170,16 +441,29 @@ async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Se
         )
         .await?;
     }
-
     Ok(())
 }
 
-async fn remove_docker_network(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let _ = run_command_allow_failure(binary, [OsString::from("network"), OsString::from("rm"), OsString::from(name)]).await;
+async fn remove_docker_network(
+    binary: &str,
+    name: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _ = run_command_allow_failure(
+        binary,
+        [
+            OsString::from("network"),
+            OsString::from("rm"),
+            OsString::from(name),
+        ],
+    )
+    .await;
     Ok(())
 }
 
-async fn create_docker_network(binary: &str, plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn create_docker_network(
+    binary: &str,
+    plan: &NetworkPlan,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     run_command_checked(
         binary,
         [
@@ -200,7 +484,10 @@ async fn create_docker_network(binary: &str, plan: &NetworkPlan) -> Result<(), B
     Ok(())
 }
 
-async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn ensure_docker_iptables_rules(
+    binary: &str,
+    plan: &NetworkPlan,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     ensure_rule_present(
         binary,
         &[
@@ -220,7 +507,6 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     ensure_rule_present(
         binary,
         &[
@@ -243,7 +529,6 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     ensure_rule_present(
         binary,
         &[
@@ -263,7 +548,6 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     ensure_rule_present(
         binary,
         &[
@@ -281,7 +565,6 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     ensure_rule_present(
         binary,
         &[
@@ -306,7 +589,6 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     ensure_rule_present(
         binary,
         &[
@@ -331,43 +613,208 @@ async fn ensure_iptables_rules(binary: &str, plan: &NetworkPlan) -> Result<(), B
         ],
     )
     .await?;
-
     Ok(())
 }
 
-async fn ensure_rule_present(binary: &str, args: &[OsString]) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn ensure_rootless_podman_rules(
+    binary: &str,
+    name: &str,
+    source_cidr: &str,
+    interface: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ensure_chain(binary, PODMAN_OUTPUT_CHAIN).await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from("OUTPUT"),
+            OsString::from("1"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:output-hook")),
+            OsString::from("-j"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("1"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:established")),
+            OsString::from("-m"),
+            OsString::from("conntrack"),
+            OsString::from("--ctstate"),
+            OsString::from("ESTABLISHED,RELATED"),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("2"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-d"),
+            OsString::from(ROOTLESS_DNS_CIDR),
+            OsString::from("-p"),
+            OsString::from("udp"),
+            OsString::from("--dport"),
+            OsString::from("53"),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:dns")),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("3"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:allow")),
+            OsString::from("-m"),
+            OsString::from("set"),
+            OsString::from("--match-set"),
+            OsString::from(name),
+            OsString::from("dst"),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("4"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:drop")),
+            OsString::from("-j"),
+            OsString::from("DROP"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-t"),
+            OsString::from("nat"),
+            OsString::from("-I"),
+            OsString::from("POSTROUTING"),
+            OsString::from("1"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-o"),
+            OsString::from(interface),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:masquerade")),
+            OsString::from("-j"),
+            OsString::from("MASQUERADE"),
+        ],
+    )
+    .await
+}
+
+async fn ensure_chain(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let create_result =
+        run_command_allow_failure(binary, [OsString::from("-N"), OsString::from(name)]).await?;
+    if create_result.status.success() {
+        return Ok(());
+    }
+    let exists_result =
+        run_command_allow_failure(binary, [OsString::from("-S"), OsString::from(name)]).await?;
+    if exists_result.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "failed to create iptables chain {name}: {}",
+        command_failure_message(&create_result)
+    )
+    .into())
+}
+
+async fn ensure_rule_present(
+    binary: &str,
+    args: &[OsString],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     remove_rule_all(binary, &delete_args(args)).await?;
     run_command_checked(binary, args.iter().cloned()).await?;
     Ok(())
 }
 
-async fn remove_rule_all(binary: &str, args: &[OsString]) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn remove_rule_all(
+    binary: &str,
+    args: &[OsString],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     loop {
-        let output = run_command_allow_failure(binary, args.iter().cloned()).await?;
-        if !output.status.success() {
-            break;
+        if !run_command_allow_failure(binary, args.iter().cloned())
+            .await?
+            .status
+            .success()
+        {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 fn delete_args(insert_args: &[OsString]) -> Vec<OsString> {
     let mut args = insert_args.to_vec();
-    for arg in args.iter_mut() {
-        if arg == "-I" || arg == "-A" {
-            *arg = OsString::from("-D");
-            break;
-        }
+    let Some(operation_index) = args.iter().position(|arg| arg == "-I" || arg == "-A") else {
+        return args;
+    };
+    args[operation_index] = OsString::from("-D");
+    let position_index = operation_index + 2;
+    if args
+        .get(position_index)
+        .and_then(|position| position.to_str())
+        .and_then(|position| position.parse::<u32>().ok())
+        .is_some()
+    {
+        args.remove(position_index);
     }
     args
 }
 
-async fn run_command_allow_failure<I, S>(binary: &str, args: I) -> Result<Output, Box<dyn Error + Send + Sync>>
+async fn run_command_allow_failure<I, S>(
+    binary: &str,
+    args: I,
+) -> Result<Output, Box<dyn Error + Send + Sync>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(binary)
+    Ok(Command::new(binary)
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
@@ -376,25 +823,28 @@ where
         .kill_on_drop(true)
         .args(args)
         .output()
-        .await?;
-
-    Ok(output)
+        .await?)
 }
 
-async fn run_command_checked<I, S>(binary: &str, args: I) -> Result<std::process::Output, Box<dyn Error + Send + Sync>>
+async fn run_command_checked<I, S>(
+    binary: &str,
+    args: I,
+) -> Result<Output, Box<dyn Error + Send + Sync>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let output = run_command_allow_failure(binary, args).await?;
-
     if output.status.success() {
         return Ok(output);
     }
+    Err(command_failure_message(&output).into())
+}
 
+fn command_failure_message(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let message = if stderr.is_empty() && stdout.is_empty() {
+    if stderr.is_empty() && stdout.is_empty() {
         "command failed".to_owned()
     } else if stdout.is_empty() {
         format!("command failed: {stderr}")
@@ -402,7 +852,79 @@ where
         format!("command failed: stdout: {stdout}")
     } else {
         format!("command failed: {stderr}; stdout: {stdout}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::net::Ipv4Addr;
+
+    use super::{
+        ROOTLESS_DNS_IP, delete_args, rootless_podman_source_ip, subnet_and_gateway,
+        validate_interface_name,
     };
 
-    Err(message.into())
+    #[test]
+    fn generated_gateways_are_valid_for_their_subnets() {
+        for attempt in 0..1000 {
+            let (subnet, gateway) = subnet_and_gateway("test-net", attempt);
+            let subnet_prefix = subnet.strip_suffix(".0/28").unwrap();
+            let subnet_octets: Vec<u8> = subnet_prefix
+                .split('.')
+                .map(|octet| octet.parse().unwrap())
+                .collect();
+            let gateway_octets: Vec<u8> = gateway
+                .split('.')
+                .map(|octet| octet.parse().unwrap())
+                .collect();
+            assert_eq!(&gateway_octets[..3], &subnet_octets[..]);
+            assert!((1..=14).contains(&gateway_octets[3]));
+        }
+    }
+
+    #[test]
+    fn rootless_podman_source_ip_is_stable_and_in_benchmark_range() {
+        let ip = rootless_podman_source_ip("test-net", 0);
+        assert_eq!(ip, rootless_podman_source_ip("test-net", 0));
+        assert_ne!(ip, rootless_podman_source_ip("test-net", 1));
+        assert_ne!(ip, Ipv4Addr::new(198, 18, 0, 0));
+        assert_ne!(ip, ROOTLESS_DNS_IP);
+        assert_ne!(ip, Ipv4Addr::new(198, 19, 255, 255));
+        assert!(
+            (u32::from(Ipv4Addr::new(198, 18, 0, 0))..=u32::from(Ipv4Addr::new(198, 19, 255, 255)))
+                .contains(&u32::from(ip))
+        );
+    }
+
+    #[test]
+    fn interface_names_are_conservative() {
+        assert_eq!(validate_interface_name("enp0s3.100").unwrap(), "enp0s3.100");
+        assert!(validate_interface_name("bad/interface").is_err());
+        assert!(validate_interface_name("non-ascii-\u{e9}").is_err());
+    }
+
+    #[test]
+    fn delete_args_remove_insert_positions() {
+        let args = vec![
+            OsString::from("-t"),
+            OsString::from("nat"),
+            OsString::from("-I"),
+            OsString::from("POSTROUTING"),
+            OsString::from("1"),
+            OsString::from("-p"),
+            OsString::from("udp"),
+        ];
+        assert_eq!(
+            delete_args(&args),
+            vec![
+                OsString::from("-t"),
+                OsString::from("nat"),
+                OsString::from("-D"),
+                OsString::from("POSTROUTING"),
+                OsString::from("-p"),
+                OsString::from("udp"),
+            ]
+        );
+    }
 }

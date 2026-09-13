@@ -42,9 +42,11 @@ async fn main() {
             run_daemon(&dns_listen_addr, &dns_upstream_addr, stats_ttl).await
         }
         Commands::PrepareNetwork {
+            runtime,
+            interface,
             name,
             domain_patterns,
-        } => prepare_network(&name, &domain_patterns).await,
+        } => prepare_network(&name, &domain_patterns, runtime, interface.as_deref()).await,
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,
