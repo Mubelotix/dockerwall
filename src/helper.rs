@@ -713,52 +713,6 @@ async fn ensure_rootless_podman_rules(
             OsString::from("4"),
             OsString::from("-s"),
             OsString::from(source_cidr),
-            OsString::from("-d"),
-            OsString::from(source_cidr),
-            OsString::from("-p"),
-            OsString::from("udp"),
-            OsString::from("--sport"),
-            OsString::from(dns_port.to_string()),
-            OsString::from("-m"),
-            OsString::from("comment"),
-            OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{name}:dns-response-udp")),
-            OsString::from("-j"),
-            OsString::from("ACCEPT"),
-        ],
-    )
-    .await?;
-    ensure_rule_present(
-        binary,
-        &[
-            OsString::from("-I"),
-            OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("5"),
-            OsString::from("-s"),
-            OsString::from(source_cidr),
-            OsString::from("-d"),
-            OsString::from(source_cidr),
-            OsString::from("-p"),
-            OsString::from("tcp"),
-            OsString::from("--sport"),
-            OsString::from(dns_port.to_string()),
-            OsString::from("-m"),
-            OsString::from("comment"),
-            OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{name}:dns-response-tcp")),
-            OsString::from("-j"),
-            OsString::from("ACCEPT"),
-        ],
-    )
-    .await?;
-    ensure_rule_present(
-        binary,
-        &[
-            OsString::from("-I"),
-            OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("6"),
-            OsString::from("-s"),
-            OsString::from(source_cidr),
             OsString::from("-m"),
             OsString::from("comment"),
             OsString::from("--comment"),
@@ -778,7 +732,7 @@ async fn ensure_rootless_podman_rules(
         &[
             OsString::from("-I"),
             OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("7"),
+            OsString::from("5"),
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-m"),
@@ -852,35 +806,6 @@ async fn ensure_rootless_dns_redirects(
                 OsString::from("REDIRECT"),
                 OsString::from("--to-ports"),
                 OsString::from(dns_port.to_string()),
-            ],
-        )
-        .await?;
-    }
-    for protocol in ["udp", "tcp"] {
-        ensure_rule_present(
-            binary,
-            &[
-                OsString::from("-t"),
-                OsString::from("nat"),
-                OsString::from("-I"),
-                OsString::from("POSTROUTING"),
-                OsString::from("1"),
-                OsString::from("-s"),
-                OsString::from(source_cidr),
-                OsString::from("-d"),
-                OsString::from(source_cidr),
-                OsString::from("-p"),
-                OsString::from(protocol),
-                OsString::from("--sport"),
-                OsString::from(dns_port.to_string()),
-                OsString::from("-m"),
-                OsString::from("comment"),
-                OsString::from("--comment"),
-                OsString::from(format!("dockerwall:{name}:dns-response-snat-{protocol}")),
-                OsString::from("-j"),
-                OsString::from("SNAT"),
-                OsString::from("--to-source"),
-                OsString::from("127.0.0.1"),
             ],
         )
         .await?;

@@ -1,11 +1,18 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{Error as IoError, ErrorKind, IoSlice, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::RData;
+use nix::sys::socket::{
+    recvmsg, sendmsg, setsockopt, sockopt, ControlMessage, ControlMessageOwned, MsgFlags,
+    SockaddrIn,
+};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::spawn;
 use tokio::sync::{RwLock, Semaphore};
@@ -27,15 +34,19 @@ pub async fn run_dns_proxy(
     dns_upstream_addr: &str,
     stats_ttl: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let listener = Arc::new(UdpSocket::bind(dns_listen_addr).await?);
+    let listener = UdpSocket::bind(dns_listen_addr).await?;
+    let receive_packet_info = listener.local_addr()?.is_ipv4();
+    if receive_packet_info {
+        setsockopt(&listener, sockopt::Ipv4PacketInfo, &true)?;
+    }
+    let listener = Arc::new(listener);
     let upstream_addr: SocketAddr = dns_upstream_addr.parse()?;
     let global_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_GLOBAL));
     println!("dockerwall dns proxy listening on {dns_listen_addr}");
 
     loop {
-        let mut request_buf = [0_u8; 4096];
-        let (request_size, client_addr) = match listener.recv_from(&mut request_buf).await {
-            Ok(res) => res,
+        let (query, client_addr, reply_source) = match receive_dns_request(&listener, receive_packet_info).await {
+            Ok(request) => request,
             Err(err) => {
                 eprintln!("proxy recv_from error: {err}");
                 continue;
@@ -47,7 +58,6 @@ pub async fn run_dns_proxy(
             continue;
         }
 
-        let query = request_buf[..request_size].to_vec();
         let listener_clone = listener.clone();
         
         // Global limit (backpressure)
@@ -82,11 +92,97 @@ pub async fn run_dns_proxy(
                 eprintln!("proxy state update error: {err}");
             }
 
-            if let Err(err) = listener_clone.send_to(&response, client_addr).await {
+            if let Err(err) = send_dns_response(&listener_clone, &response, client_addr, reply_source).await {
                 eprintln!("proxy send_to error: {err}");
             }
         });
     }
+}
+
+async fn receive_dns_request(
+    listener: &UdpSocket,
+    receive_packet_info: bool,
+) -> Result<(Vec<u8>, SocketAddr, Option<nix::libc::in_addr>), IoError> {
+    if !receive_packet_info {
+        let mut request_buf = [0_u8; 4096];
+        let (request_size, client_addr) = listener.recv_from(&mut request_buf).await?;
+        return Ok((request_buf[..request_size].to_vec(), client_addr, None));
+    }
+
+    listener
+        .async_io(Interest::READABLE, || {
+            let mut request_buf = [0_u8; 4096];
+            let mut buffers = [IoSliceMut::new(&mut request_buf)];
+            let mut control = nix::cmsg_space!(nix::libc::in_pktinfo);
+            let message = recvmsg::<SockaddrIn>(
+                listener.as_raw_fd(),
+                &mut buffers,
+                Some(&mut control),
+                MsgFlags::empty(),
+            )
+            .map_err(IoError::from)?;
+            if message.flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
+                return Err(IoError::new(ErrorKind::InvalidData, "truncated DNS packet"));
+            }
+
+            let (request_size, client_addr, reply_source) = {
+                let client_addr = message
+                    .address
+                    .map(SocketAddr::from)
+                    .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "DNS packet has no source address"))?;
+                let reply_source = message
+                    .cmsgs()
+                    .map_err(IoError::from)?
+                    .find_map(|message| match message {
+                        ControlMessageOwned::Ipv4PacketInfo(packet_info) => Some(packet_info.ipi_spec_dst),
+                        _ => None,
+                    })
+                    .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "DNS packet has no destination address"))?;
+                (message.bytes, client_addr, reply_source)
+            };
+            let query = request_buf[..request_size].to_vec();
+            Ok((query, client_addr, Some(reply_source)))
+        })
+        .await
+}
+
+async fn send_dns_response(
+    listener: &UdpSocket,
+    response: &[u8],
+    client_addr: SocketAddr,
+    reply_source: Option<nix::libc::in_addr>,
+) -> Result<(), IoError> {
+    let Some(reply_source) = reply_source else {
+        listener.send_to(response, client_addr).await?;
+        return Ok(());
+    };
+    let SocketAddr::V4(client_addr) = client_addr else {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "IPv4 packet information with an IPv6 client",
+        ));
+    };
+
+    listener
+        .async_io(Interest::WRITABLE, || {
+            let packet_info = nix::libc::in_pktinfo {
+                ipi_ifindex: 0,
+                ipi_spec_dst: reply_source,
+                ipi_addr: nix::libc::in_addr { s_addr: 0 },
+            };
+            let buffers = [IoSlice::new(response)];
+            let control = [ControlMessage::Ipv4PacketInfo(&packet_info)];
+            sendmsg(
+                listener.as_raw_fd(),
+                &buffers,
+                &control,
+                MsgFlags::empty(),
+                Some(&SockaddrIn::from(client_addr)),
+            )
+            .map(|_| ())
+            .map_err(IoError::from)
+        })
+        .await
 }
 
 fn is_local_ip(ip: IpAddr) -> bool {

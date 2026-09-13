@@ -33,14 +33,10 @@ cleanup() {
     remove_rule -t nat -D OUTPUT -s "$source_cidr" -d "$DNS_IP/32" -p tcp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-OUTPUT-tcp" -j REDIRECT --to-ports "$DNS_PORT"
     remove_rule -t nat -D PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
     remove_rule -t nat -D PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p tcp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-tcp" -j REDIRECT --to-ports "$DNS_PORT"
-    remove_rule -t nat -D POSTROUTING -s "$source_cidr" -d "$source_cidr" -p udp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-snat-udp" -j SNAT --to-source 127.0.0.1
-    remove_rule -t nat -D POSTROUTING -s "$source_cidr" -d "$source_cidr" -p tcp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-snat-tcp" -j SNAT --to-source 127.0.0.1
     remove_rule -D OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:output-hook" -j DOCKERWALL-OUTPUT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:established" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p udp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-udp" -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d 127.0.0.1/32 -p tcp --dport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-tcp" -j ACCEPT
-    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d "$source_cidr" -p udp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-udp" -j ACCEPT
-    remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -d "$source_cidr" -p tcp --sport "$DNS_PORT" -m comment --comment "dockerwall:$NETWORK:dns-response-tcp" -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:allow" -m set --match-set "$NETWORK" dst -j ACCEPT
     remove_rule -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:drop" -j DROP
     sudo ip addr del "$source_cidr" dev "$OUTBOUND_INTERFACE" >/dev/null 2>&1 || true
