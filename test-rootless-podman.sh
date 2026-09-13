@@ -128,6 +128,7 @@ fi
 if ! podman run --rm --network "pasta:--outbound,$SOURCE_IP" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null; then
   sudo iptables -v -L OUTPUT -n --line-numbers
   sudo iptables -v -L DOCKERWALL-OUTPUT -n --line-numbers
+  sudo iptables -t nat -v -L POSTROUTING -n --line-numbers
   cat /tmp/dockerwall-rootless.log
   exit 1
 fi
