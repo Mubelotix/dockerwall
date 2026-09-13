@@ -71,8 +71,8 @@ cleanup() {
     remove_rule6 -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:allow" -m set --match-set "$NETWORK-v6" dst -j ACCEPT
     remove_rule6 -D DOCKERWALL-OUTPUT -s "$source_cidr" -m comment --comment "dockerwall:$NETWORK:drop" -j DROP
     sudo ip -6 addr del "$SOURCE_IPV6/64" dev "$OUTBOUND_INTERFACE" >/dev/null 2>&1 || true
-    sudo ipset destroy "$NETWORK-v6" >/dev/null 2>&1 || true
   fi
+  sudo ipset destroy "$NETWORK-v6" >/dev/null 2>&1 || true
 
   if [ -n "$DAEMON_PID" ]; then
     sudo kill "$DAEMON_PID" >/dev/null 2>&1 || true
@@ -150,8 +150,7 @@ fi
 if [[ "$PREPARE_OUTPUT" =~ rootless[[:space:]]Podman[[:space:]]source[[:space:]]IPv6:[[:space:]]([0-9a-f:]+) ]]; then
   SOURCE_IPV6="${BASH_REMATCH[1]}"
 else
-  echo "prepare-network did not report the pasta source IPv6"
-  exit 1
+  echo "rootless Podman IPv6 unavailable; skipping IPv6 checks"
 fi
 if [[ "$PREPARE_OUTPUT" =~ rootless[[:space:]]Podman[[:space:]]interface:[[:space:]]([[:alnum:]._-]+) ]]; then
   OUTBOUND_INTERFACE="${BASH_REMATCH[1]}"
@@ -166,7 +165,10 @@ if [ -n "$DAEMON_PID" ]; then
   sudo iptables -t nat -C PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
 fi
 
-PODMAN_NETWORK="pasta:--outbound,$SOURCE_IP,--address,$SOURCE_IPV6,--outbound,$SOURCE_IPV6"
+PODMAN_NETWORK="pasta:--outbound,$SOURCE_IP"
+if [ -n "$SOURCE_IPV6" ]; then
+  PODMAN_NETWORK+=",--address,$SOURCE_IPV6,--outbound,$SOURCE_IPV6"
+fi
 if ! podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv4 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null; then
   report_firewall
   exit 1
@@ -180,15 +182,17 @@ if podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv4 -
 fi
 echo "$BLOCKED_DOMAIN IPv4 blocked as expected"
 
-if ! podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv6 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null; then
-  report_firewall
-  exit 1
-fi
-echo "$ALLOWED_DOMAIN IPv6 OK"
+if [ -n "$SOURCE_IPV6" ]; then
+  if ! podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv6 -sS --max-time 10 "http://$ALLOWED_DOMAIN" >/dev/null; then
+    report_firewall
+    exit 1
+  fi
+  echo "$ALLOWED_DOMAIN IPv6 OK"
 
-if podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv6 -sS --max-time 10 "http://$BLOCKED_DOMAIN" >/dev/null; then
-  echo "$BLOCKED_DOMAIN IPv6 reachable (FAIL)"
-  report_firewall
-  exit 1
+  if podman run --rm --network "$PODMAN_NETWORK" --dns "$DNS_IP" "$IMAGE" --ipv6 -sS --max-time 10 "http://$BLOCKED_DOMAIN" >/dev/null; then
+    echo "$BLOCKED_DOMAIN IPv6 reachable (FAIL)"
+    report_firewall
+    exit 1
+  fi
+  echo "$BLOCKED_DOMAIN IPv6 blocked as expected"
 fi
-echo "$BLOCKED_DOMAIN IPv6 blocked as expected"

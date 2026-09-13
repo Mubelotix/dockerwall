@@ -98,8 +98,8 @@ async fn prepare_rootless_podman_network(
     let source_ip = allocate_rootless_podman_source_ip(iptables_binary, ip_binary, name).await?;
     let source_cidr = format!("{source_ip}/32");
     let source_ipv6 = allocate_rootless_podman_source_ipv6(ip_binary, &interface, name).await?;
-    let source_ipv6_cidr = format!("{source_ipv6}/128");
-    let source_ipv6_pasta_cidr = format!("{source_ipv6}/64");
+    let source_ipv6_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/128"));
+    let source_ipv6_pasta_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/64"));
 
     run_command_checked(
         ip_binary,
@@ -112,18 +112,20 @@ async fn prepare_rootless_podman_network(
         ],
     )
     .await?;
-    run_command_checked(
-        ip_binary,
-        [
-            OsString::from("-6"),
-            OsString::from("addr"),
-            OsString::from("replace"),
-            OsString::from(&source_ipv6_pasta_cidr),
-            OsString::from("dev"),
-            OsString::from(&interface),
-        ],
-    )
-    .await?;
+    if let Some(source_ipv6_pasta_cidr) = &source_ipv6_pasta_cidr {
+        run_command_checked(
+            ip_binary,
+            [
+                OsString::from("-6"),
+                OsString::from("addr"),
+                OsString::from("replace"),
+                OsString::from(source_ipv6_pasta_cidr),
+                OsString::from("dev"),
+                OsString::from(&interface),
+            ],
+        )
+        .await?;
+    }
     destroy_ipsets(ipset_binary, name).await?;
     create_ipsets(ipset_binary, name).await?;
     ensure_rootless_podman_rules(
@@ -131,7 +133,7 @@ async fn prepare_rootless_podman_network(
         ip6tables_binary,
         name,
         &source_cidr,
-        &source_ipv6_cidr,
+        source_ipv6_cidr.as_deref(),
         &interface,
         dns_port,
     )
@@ -139,11 +141,18 @@ async fn prepare_rootless_podman_network(
     send_create(name, Some(&source_cidr), domain_patterns).await?;
 
     println!("rootless Podman source IP: {source_ip}");
-    println!("rootless Podman source IPv6: {source_ipv6}");
     println!("rootless Podman interface: {interface}");
-    println!(
-        "podman run --network pasta:--outbound,{source_ip},--address,{source_ipv6},--outbound,{source_ipv6} --dns {ROOTLESS_DNS_IP} <image> <command>"
-    );
+    if let Some(source_ipv6) = source_ipv6 {
+        println!("rootless Podman source IPv6: {source_ipv6}");
+        println!(
+            "podman run --network pasta:--outbound,{source_ip},--address,{source_ipv6},--outbound,{source_ipv6} --dns {ROOTLESS_DNS_IP} <image> <command>"
+        );
+    } else {
+        println!("rootless Podman IPv6 unavailable: no global /64 on {interface}");
+        println!(
+            "podman run --network pasta:--outbound,{source_ip} --dns {ROOTLESS_DNS_IP} <image> <command>"
+        );
+    }
     Ok(())
 }
 
@@ -339,8 +348,10 @@ async fn allocate_rootless_podman_source_ipv6(
     ip_binary: &str,
     interface: &str,
     name: &str,
-) -> Result<Ipv6Addr, Box<dyn Error + Send + Sync>> {
-    let prefix = rootless_podman_ipv6_prefix(ip_binary, interface).await?;
+) -> Result<Option<Ipv6Addr>, Box<dyn Error + Send + Sync>> {
+    let Some(prefix) = rootless_podman_ipv6_prefix(ip_binary, interface).await? else {
+        return Ok(None);
+    };
 
     for attempt in 0u32..50 {
         let source_ip = rootless_podman_source_ipv6(prefix, name, attempt);
@@ -358,7 +369,7 @@ async fn allocate_rootless_podman_source_ipv6(
         )
         .await?;
         if output.stdout.is_empty() {
-            return Ok(source_ip);
+            return Ok(Some(source_ip));
         }
     }
 
@@ -368,7 +379,7 @@ async fn allocate_rootless_podman_source_ipv6(
 async fn rootless_podman_ipv6_prefix(
     ip_binary: &str,
     interface: &str,
-) -> Result<Ipv6Addr, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<Ipv6Addr>, Box<dyn Error + Send + Sync>> {
     let output = run_command_checked(
         ip_binary,
         [
@@ -406,10 +417,10 @@ async fn rootless_podman_ipv6_prefix(
         let Ok(address) = address.parse::<Ipv6Addr>() else {
             continue;
         };
-        return Ok(address);
+        return Ok(Some(address));
     }
 
-    Err("rootless Podman IPv6 requires a global /64 on the outbound interface".into())
+    Ok(None)
 }
 
 fn rootless_podman_source_ipv6(prefix: Ipv6Addr, name: &str, attempt: u32) -> Ipv6Addr {
@@ -745,7 +756,7 @@ async fn ensure_rootless_podman_rules(
     ip6tables_binary: &str,
     name: &str,
     source_cidr: &str,
-    source_ipv6_cidr: &str,
+    source_ipv6_cidr: Option<&str>,
     interface: &str,
     dns_port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -902,7 +913,10 @@ async fn ensure_rootless_podman_rules(
         ],
     )
     .await?;
-    ensure_rootless_podman_ipv6_rules(ip6tables_binary, name, source_ipv6_cidr).await
+    if let Some(source_ipv6_cidr) = source_ipv6_cidr {
+        ensure_rootless_podman_ipv6_rules(ip6tables_binary, name, source_ipv6_cidr).await?;
+    }
+    Ok(())
 }
 
 async fn ensure_rootless_podman_ipv6_rules(
