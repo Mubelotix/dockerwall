@@ -1,0 +1,22 @@
+name: Rootless Podman E2E
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Podman and Pasta
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman passt
+      - run: podman info --format '{{.Host.Security.Rootless}}'
+      - run: ./test-rootless-podman.sh
