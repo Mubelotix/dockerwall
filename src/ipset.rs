@@ -8,14 +8,24 @@ use crate::trust::is_trusted_binary;
 
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
 
-pub async fn update_ipset(name: String, ips: Vec<IpAddr>) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn ipv6_ipset_name(name: &str) -> String {
+    format!("{name}-v6")
+}
+
+pub async fn update_ipset(
+    name: String,
+    ips: Vec<IpAddr>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ipset_binary = resolve_ipset_binary().await?;
+    let ipv6_name = ipv6_ipset_name(&name);
 
-    let ipv4s: Vec<IpAddr> = ips.into_iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect();
-
-    let mut payload = format!("flush {name}\n");
-    for ip in ipv4s {
-        payload.push_str(&format!("add {name} {ip} -exist\n"));
+    let mut payload = format!("flush {name}\nflush {ipv6_name}\n");
+    for ip in ips {
+        let ipset = match ip {
+            IpAddr::V4(_) => &name,
+            IpAddr::V6(_) => &ipv6_name,
+        };
+        payload.push_str(&format!("add {ipset} {ip} -exist\n"));
     }
 
     let mut child = Command::new(ipset_binary)

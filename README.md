@@ -40,13 +40,13 @@ sudo dockerwall prepare-network secure-net "*.example.com"
 Rootless Podman uses host-root Dockerwall policy resources. Preparing the logical policy name reserves the host-only `198.18.0.1/32` alias on `lo` and starts an external host daemon when no responsive control socket exists:
 ```bash
 sudo dockerwall prepare-network --runtime podman secure-net "*.example.com"
-# prepare-network prints the deterministic source IP and this invocation:
-podman run --rm --network pasta:--outbound,<source-ip> --dns 198.18.0.1 docker.io/curlimages/curl:latest --ipv4 -sS --max-time 5 http://example.com
+# prepare-network prints deterministic IPv4 and IPv6 source addresses and this invocation:
+podman run --rm --network pasta:--outbound,<source-ip>,--outbound,<source-ipv6> --dns 198.18.0.1 docker.io/curlimages/curl:latest -sS --max-time 5 http://example.com
 ```
 
 `prepare-network` requires host root. It uses the DNS port reported by the daemon owning `/run/dockerwall.sock`; when no daemon is running, Dockerwall starts one with its default `127.0.0.1:5353` listener. Dockerwall redirects DNS sent to `198.18.0.1:53` to that daemon port in the host NAT `OUTPUT` and `PREROUTING` chains. Dockerwall never enters a Podman or container namespace. It derives the outbound interface from the default route, or accepts `--interface <name>` when that route is unsuitable. The logical policy name is not a Podman bridge network. Dockerwall assigns its deterministic `198.18.0.0/15` source `/32` to that host interface, excluding the fixed DNS alias, then prints the matching `pasta:--outbound` and `--dns` arguments.
 
-The host needs rootless Podman with pasta, `ip`, `ipset`, and `iptables`. Containers still query `198.18.0.1:53`; host NAT redirects those queries to Dockerwall's configured listener while pasta keeps the per-policy source alias for outbound traffic.
+The host needs rootless Podman with pasta, `ip`, `ipset`, `iptables`, and `ip6tables`. IPv6 support requires a routed global `/64` on the outbound interface. Containers still query `198.18.0.1:53`; host NAT redirects those queries to Dockerwall's configured listener while pasta keeps the per-policy IPv4 and IPv6 source aliases for outbound traffic. Dockerwall adds A and AAAA answers to separate address-family-specific ipsets, then applies the default-deny policy through `iptables` and `ip6tables`.
 
 Run the rootless end-to-end test with:
 ```bash

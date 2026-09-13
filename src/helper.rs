@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
@@ -11,12 +11,14 @@ use tokio::time::sleep;
 
 use crate::cli::ContainerRuntime;
 use crate::control::get_dns_port;
+use crate::ipset::ipv6_ipset_name;
 use crate::manage::send_create;
 use crate::trust::is_trusted_binary;
 
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
 const DOCKER_CANDIDATES: [&str; 3] = ["/usr/bin/docker", "/bin/docker", "/usr/local/bin/docker"];
 const IPTABLES_CANDIDATES: [&str; 2] = ["/usr/sbin/iptables", "/sbin/iptables"];
+const IP6TABLES_CANDIDATES: [&str; 2] = ["/usr/sbin/ip6tables", "/sbin/ip6tables"];
 const IP_CANDIDATES: [&str; 3] = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"];
 const PODMAN_OUTPUT_CHAIN: &str = "DOCKERWALL-OUTPUT";
 const ROOTLESS_DNS_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
@@ -92,8 +94,12 @@ async fn prepare_rootless_podman_network(
     };
     let ipset_binary = resolve_binary(&IPSET_CANDIDATES).await?;
     let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES).await?;
+    let ip6tables_binary = resolve_binary(&IP6TABLES_CANDIDATES).await?;
     let source_ip = allocate_rootless_podman_source_ip(iptables_binary, ip_binary, name).await?;
     let source_cidr = format!("{source_ip}/32");
+    let source_ipv6 = allocate_rootless_podman_source_ipv6(ip_binary, &interface, name).await?;
+    let source_ipv6_cidr = format!("{source_ipv6}/128");
+    let source_ipv6_pasta_cidr = format!("{source_ipv6}/64");
 
     run_command_checked(
         ip_binary,
@@ -106,15 +112,37 @@ async fn prepare_rootless_podman_network(
         ],
     )
     .await?;
-    destroy_ipset(ipset_binary, name).await?;
-    create_ipset(ipset_binary, name).await?;
-    ensure_rootless_podman_rules(iptables_binary, name, &source_cidr, &interface, dns_port).await?;
+    run_command_checked(
+        ip_binary,
+        [
+            OsString::from("-6"),
+            OsString::from("addr"),
+            OsString::from("replace"),
+            OsString::from(&source_ipv6_pasta_cidr),
+            OsString::from("dev"),
+            OsString::from(&interface),
+        ],
+    )
+    .await?;
+    destroy_ipsets(ipset_binary, name).await?;
+    create_ipsets(ipset_binary, name).await?;
+    ensure_rootless_podman_rules(
+        iptables_binary,
+        ip6tables_binary,
+        name,
+        &source_cidr,
+        &source_ipv6_cidr,
+        &interface,
+        dns_port,
+    )
+    .await?;
     send_create(name, Some(&source_cidr), domain_patterns).await?;
 
     println!("rootless Podman source IP: {source_ip}");
+    println!("rootless Podman source IPv6: {source_ipv6}");
     println!("rootless Podman interface: {interface}");
     println!(
-        "podman run --network pasta:--outbound,{source_ip} --dns {ROOTLESS_DNS_IP} <image> <command>"
+        "podman run --network pasta:--outbound,{source_ip},--address,{source_ipv6},--outbound,{source_ipv6} --dns {ROOTLESS_DNS_IP} <image> <command>"
     );
     Ok(())
 }
@@ -307,13 +335,101 @@ fn rootless_podman_source_ip(name: &str, attempt: u32) -> Ipv4Addr {
     Ipv4Addr::from(base + offset)
 }
 
+async fn allocate_rootless_podman_source_ipv6(
+    ip_binary: &str,
+    interface: &str,
+    name: &str,
+) -> Result<Ipv6Addr, Box<dyn Error + Send + Sync>> {
+    let prefix = rootless_podman_ipv6_prefix(ip_binary, interface).await?;
+
+    for attempt in 0u32..50 {
+        let source_ip = rootless_podman_source_ipv6(prefix, name, attempt);
+        let source_cidr = format!("{source_ip}/128");
+        let output = run_command_checked(
+            ip_binary,
+            [
+                OsString::from("-o"),
+                OsString::from("-6"),
+                OsString::from("addr"),
+                OsString::from("show"),
+                OsString::from("to"),
+                OsString::from(&source_cidr),
+            ],
+        )
+        .await?;
+        if output.stdout.is_empty() {
+            return Ok(source_ip);
+        }
+    }
+
+    Err("all managed rootless Podman IPv6 source addresses are in use".into())
+}
+
+async fn rootless_podman_ipv6_prefix(
+    ip_binary: &str,
+    interface: &str,
+) -> Result<Ipv6Addr, Box<dyn Error + Send + Sync>> {
+    let output = run_command_checked(
+        ip_binary,
+        [
+            OsString::from("-o"),
+            OsString::from("-6"),
+            OsString::from("addr"),
+            OsString::from("show"),
+            OsString::from("dev"),
+            OsString::from(interface),
+            OsString::from("scope"),
+            OsString::from("global"),
+        ],
+    )
+    .await?;
+    let output = String::from_utf8_lossy(&output.stdout);
+
+    for line in output.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let cidr = loop {
+            match fields.next() {
+                Some("inet6") => break fields.next(),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        let Some(cidr) = cidr else {
+            continue;
+        };
+        let Some((address, prefix_length)) = cidr.split_once('/') else {
+            continue;
+        };
+        if prefix_length != "64" {
+            continue;
+        }
+        let Ok(address) = address.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        return Ok(address);
+    }
+
+    Err("rootless Podman IPv6 requires a global /64 on the outbound interface".into())
+}
+
+fn rootless_podman_source_ipv6(prefix: Ipv6Addr, name: &str, attempt: u32) -> Ipv6Addr {
+    let hash = name
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+        .wrapping_add(u64::from(attempt));
+    Ipv6Addr::from((u128::from(prefix) & (!0_u128 << 64)) | u128::from(hash))
+}
+
 async fn setup_docker_resources(plan: &NetworkPlan) -> Result<(), Box<dyn Error + Send + Sync>> {
     let ipset_binary = resolve_binary(&IPSET_CANDIDATES).await?;
     let docker_binary = resolve_binary(&DOCKER_CANDIDATES).await?;
     let iptables_binary = resolve_binary(&IPTABLES_CANDIDATES).await?;
 
-    destroy_ipset(ipset_binary, &plan.name).await?;
-    create_ipset(ipset_binary, &plan.name).await?;
+    destroy_ipsets(ipset_binary, &plan.name).await?;
+    create_ipsets(ipset_binary, &plan.name).await?;
     remove_docker_network(docker_binary, &plan.name).await?;
     create_docker_network(docker_binary, plan).await?;
     ensure_docker_iptables_rules(iptables_binary, plan).await
@@ -366,19 +482,33 @@ async fn resolve_binary(
     Err("trusted binary not found".into())
 }
 
-async fn destroy_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let _ =
-        run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(name)]).await;
+async fn destroy_ipsets(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for name in [name.to_owned(), ipv6_ipset_name(name)] {
+        let _ =
+            run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(name)])
+                .await;
+    }
     Ok(())
 }
 
-async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn create_ipsets(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    create_ipset(binary, name, "inet").await?;
+    create_ipset(binary, &ipv6_ipset_name(name), "inet6").await
+}
+
+async fn create_ipset(
+    binary: &str,
+    name: &str,
+    family: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let result = run_command_allow_failure(
         binary,
         [
             OsString::from("create"),
             OsString::from(name),
             OsString::from("hash:ip"),
+            OsString::from("family"),
+            OsString::from(family),
             OsString::from("maxelem"),
             OsString::from("1000000000"),
             OsString::from("-exist"),
@@ -401,6 +531,8 @@ async fn create_ipset(binary: &str, name: &str) -> Result<(), Box<dyn Error + Se
             OsString::from("create"),
             OsString::from(&tmp_name),
             OsString::from("hash:ip"),
+            OsString::from("family"),
+            OsString::from(family),
             OsString::from("maxelem"),
             OsString::from("1000000000"),
         ],
@@ -610,8 +742,10 @@ async fn ensure_docker_iptables_rules(
 
 async fn ensure_rootless_podman_rules(
     binary: &str,
+    ip6tables_binary: &str,
     name: &str,
     source_cidr: &str,
+    source_ipv6_cidr: &str,
     interface: &str,
     dns_port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -767,7 +901,122 @@ async fn ensure_rootless_podman_rules(
             OsString::from("MASQUERADE"),
         ],
     )
-    .await
+    .await?;
+    ensure_rootless_podman_ipv6_rules(ip6tables_binary, name, source_ipv6_cidr).await
+}
+
+async fn ensure_rootless_podman_ipv6_rules(
+    binary: &str,
+    name: &str,
+    source_cidr: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ensure_chain(binary, PODMAN_OUTPUT_CHAIN).await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from("OUTPUT"),
+            OsString::from("1"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:output-hook")),
+            OsString::from("-j"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("1"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:established")),
+            OsString::from("-m"),
+            OsString::from("conntrack"),
+            OsString::from("--ctstate"),
+            OsString::from("ESTABLISHED,RELATED"),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    for (position, icmp_type) in [
+        ("2", "neighbor-solicitation"),
+        ("3", "neighbor-advertisement"),
+    ] {
+        ensure_rule_present(
+            binary,
+            &[
+                OsString::from("-I"),
+                OsString::from(PODMAN_OUTPUT_CHAIN),
+                OsString::from(position),
+                OsString::from("-s"),
+                OsString::from(source_cidr),
+                OsString::from("-p"),
+                OsString::from("ipv6-icmp"),
+                OsString::from("-m"),
+                OsString::from("icmp6"),
+                OsString::from("--icmpv6-type"),
+                OsString::from(icmp_type),
+                OsString::from("-m"),
+                OsString::from("comment"),
+                OsString::from("--comment"),
+                OsString::from(format!("dockerwall:{name}:{icmp_type}")),
+                OsString::from("-j"),
+                OsString::from("ACCEPT"),
+            ],
+        )
+        .await?;
+    }
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("4"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:allow")),
+            OsString::from("-m"),
+            OsString::from("set"),
+            OsString::from("--match-set"),
+            OsString::from(ipv6_ipset_name(name)),
+            OsString::from("dst"),
+            OsString::from("-j"),
+            OsString::from("ACCEPT"),
+        ],
+    )
+    .await?;
+    ensure_rule_present(
+        binary,
+        &[
+            OsString::from("-I"),
+            OsString::from(PODMAN_OUTPUT_CHAIN),
+            OsString::from("5"),
+            OsString::from("-s"),
+            OsString::from(source_cidr),
+            OsString::from("-m"),
+            OsString::from("comment"),
+            OsString::from("--comment"),
+            OsString::from(format!("dockerwall:{name}:drop")),
+            OsString::from("-j"),
+            OsString::from("DROP"),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn ensure_rootless_dns_redirects(
@@ -928,8 +1177,8 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::{
-        ROOTLESS_DNS_IP, delete_args, rootless_podman_source_ip, subnet_and_gateway,
-        validate_interface_name,
+        ROOTLESS_DNS_IP, delete_args, rootless_podman_source_ip, rootless_podman_source_ipv6,
+        subnet_and_gateway, validate_interface_name,
     };
 
     #[test]
@@ -962,6 +1211,15 @@ mod tests {
             (u32::from(Ipv4Addr::new(198, 18, 0, 0))..=u32::from(Ipv4Addr::new(198, 19, 255, 255)))
                 .contains(&u32::from(ip))
         );
+    }
+
+    #[test]
+    fn rootless_podman_source_ipv6_is_stable_and_unique_per_attempt() {
+        let prefix = "2001:db8::1".parse().unwrap();
+        let ip = rootless_podman_source_ipv6(prefix, "test-net", 0);
+        assert_eq!(ip, rootless_podman_source_ipv6(prefix, "test-net", 0));
+        assert_ne!(ip, rootless_podman_source_ipv6(prefix, "test-net", 1));
+        assert_eq!(&ip.segments()[..4], &prefix.segments()[..4]);
     }
 
     #[test]
