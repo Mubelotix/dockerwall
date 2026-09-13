@@ -14,5 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install firewall dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ipset
       - run: docker info
       - run: ./test.sh
