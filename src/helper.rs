@@ -97,7 +97,8 @@ async fn prepare_rootless_podman_network(
     let ip6tables_binary = resolve_binary(&IP6TABLES_CANDIDATES).await?;
     let source_ip = allocate_rootless_podman_source_ip(iptables_binary, ip_binary, name).await?;
     let source_cidr = format!("{source_ip}/32");
-    let source_ipv6 = allocate_rootless_podman_source_ipv6(ip_binary, &interface, name).await?;
+    let source_ipv6 =
+        allocate_rootless_podman_source_ipv6(ip6tables_binary, ip_binary, &interface, name).await?;
     let source_ipv6_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/128"));
     let source_ipv6_pasta_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/64"));
 
@@ -331,6 +332,16 @@ fn output_rule_source_ip(rule: &str) -> Option<Ipv4Addr> {
     None
 }
 
+fn output_rule_source_ipv6(rule: &str) -> Option<Ipv6Addr> {
+    let mut fields = rule.split_ascii_whitespace();
+    while let Some(field) = fields.next() {
+        if field == "-s" {
+            return fields.next()?.strip_suffix("/128")?.parse().ok();
+        }
+    }
+    None
+}
+
 fn rootless_podman_source_ip(name: &str, attempt: u32) -> Ipv4Addr {
     // FNV-1a is stable across processes and releases, unlike a randomized map hasher.
     let hash = name
@@ -345,6 +356,7 @@ fn rootless_podman_source_ip(name: &str, attempt: u32) -> Ipv4Addr {
 }
 
 async fn allocate_rootless_podman_source_ipv6(
+    ip6tables_binary: &str,
     ip_binary: &str,
     interface: &str,
     name: &str,
@@ -352,6 +364,26 @@ async fn allocate_rootless_podman_source_ipv6(
     let Some(prefix) = rootless_podman_ipv6_prefix(ip_binary, interface).await? else {
         return Ok(None);
     };
+
+    // Reuse this policy's assigned address on repeated preparation. Without
+    // this check, every invocation sees its previous address as occupied and
+    // consumes another candidate from the finite deterministic range.
+    let output = run_command_checked(
+        ip6tables_binary,
+        [OsString::from("-S"), OsString::from("OUTPUT")],
+    )
+    .await?;
+    let rules = String::from_utf8_lossy(&output.stdout);
+    let own_marker = format!("dockerwall:{name}:output-hook");
+    for line in rules.lines() {
+        if line.contains(&own_marker) {
+            if let Some(source_ip) = output_rule_source_ipv6(line) {
+                if source_ip.segments()[..4] == prefix.segments()[..4] {
+                    return Ok(Some(source_ip));
+                }
+            }
+        }
+    }
 
     for attempt in 0u32..50 {
         let source_ip = rootless_podman_source_ipv6(prefix, name, attempt);
@@ -1188,10 +1220,14 @@ fn command_failure_message(output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fs;
     use std::net::Ipv4Addr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ROOTLESS_DNS_IP, delete_args, rootless_podman_source_ip, rootless_podman_source_ipv6,
+        ROOTLESS_DNS_IP, allocate_rootless_podman_source_ipv6, delete_args,
+        output_rule_source_ipv6, rootless_podman_source_ip, rootless_podman_source_ipv6,
         subnet_and_gateway, validate_interface_name,
     };
 
@@ -1234,6 +1270,110 @@ mod tests {
         assert_eq!(ip, rootless_podman_source_ipv6(prefix, "test-net", 0));
         assert_ne!(ip, rootless_podman_source_ipv6(prefix, "test-net", 1));
         assert_eq!(&ip.segments()[..4], &prefix.segments()[..4]);
+    }
+
+    #[test]
+    fn output_rule_source_ipv6_parses_owned_hook_rule() {
+        assert_eq!(
+            output_rule_source_ipv6(
+                "-A OUTPUT -s 2001:db8::1234/128 -m comment --comment dockerwall:test-net:output-hook -j DOCKERWALL-OUTPUT"
+            ),
+            Some("2001:db8::1234".parse().unwrap())
+        );
+        assert_eq!(
+            output_rule_source_ipv6("-A OUTPUT -s 2001:db8::1234/64 -j DOCKERWALL-OUTPUT"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_rootless_preparation_reuses_its_ipv6_address() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "dockerwall-ipv6-reuse-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+
+        let ip_binary = directory.join("ip");
+        let ip6tables_binary = directory.join("ip6tables");
+        let assigned_addresses = directory.join("assigned-addresses");
+        let firewall_rules = directory.join("firewall-rules");
+
+        fs::write(
+            &ip_binary,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "-o" ] && [ "$2" = "-6" ] && [ "$3" = "addr" ] && [ "$4" = "show" ] && [ "$5" = "dev" ]; then
+  printf '%s\n' '2: test0 inet6 2001:db8:1::1/64 scope global'
+  exit 0
+fi
+if [ "$1" = "-o" ] && [ "$2" = "-6" ] && [ "$3" = "addr" ] && [ "$4" = "show" ] && [ "$5" = "to" ]; then
+  requested="${{6%/128}}"
+  if [ -f '{assigned}' ]; then
+    while IFS= read -r address; do
+      if [ "$address" = "$requested" ]; then
+        printf '2: test0 inet6 %s/64 scope global\n' "$address"
+        break
+      fi
+    done < '{assigned}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+                assigned = assigned_addresses.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &ip6tables_binary,
+            format!(
+                "#!/bin/sh\nif [ -f '{rules}' ]; then /bin/cat '{rules}'; fi\n",
+                rules = firewall_rules.display()
+            ),
+        )
+        .unwrap();
+        for binary in [&ip_binary, &ip6tables_binary] {
+            let mut permissions = fs::metadata(binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(binary, permissions).unwrap();
+        }
+
+        let first = allocate_rootless_podman_source_ipv6(
+            ip6tables_binary.to_str().unwrap(),
+            ip_binary.to_str().unwrap(),
+            "test0",
+            "test-net",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        fs::write(&assigned_addresses, format!("{first}\n")).unwrap();
+        fs::write(
+            &firewall_rules,
+            format!(
+                "-A OUTPUT -s {first}/128 -m comment --comment dockerwall:test-net:output-hook -j DOCKERWALL-OUTPUT\n"
+            ),
+        )
+        .unwrap();
+
+        let second = allocate_rootless_podman_source_ipv6(
+            ip6tables_binary.to_str().unwrap(),
+            ip_binary.to_str().unwrap(),
+            "test0",
+            "test-net",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(second, first);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
