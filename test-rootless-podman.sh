@@ -165,6 +165,13 @@ if [ -n "$DAEMON_PID" ]; then
   sudo iptables -t nat -C PREROUTING -s "$source_cidr" -d "$DNS_IP/32" -p udp --dport 53 -m comment --comment "dockerwall:$NETWORK:dns-PREROUTING-udp" -j REDIRECT --to-ports "$DNS_PORT"
 fi
 
+if [ -n "$SOURCE_IPV6" ]; then
+  if ! ip -o -6 addr show dev "$OUTBOUND_INTERFACE" to "$SOURCE_IPV6/128" | grep -q 'preferred_lft 0sec'; then
+    echo "dedicated IPv6 source address is not deprecated (FAIL)"
+    exit 1
+  fi
+fi
+
 PODMAN_NETWORK="pasta:--outbound,$SOURCE_IP"
 if [ -n "$SOURCE_IPV6" ]; then
   PODMAN_NETWORK+=",--address,$SOURCE_IPV6,--outbound,$SOURCE_IPV6"

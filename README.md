@@ -48,6 +48,8 @@ podman run --rm --network pasta:--outbound,<source-ip>,--outbound,<source-ipv6> 
 
 The host needs rootless Podman with pasta, `ip`, `ipset`, `iptables`, and `ip6tables`. When the outbound interface has a routed global `/64`, Dockerwall also configures IPv6 enforcement. Containers still query `198.18.0.1:53`; host NAT redirects those queries to Dockerwall's configured listener while pasta keeps the per-policy IPv4 and IPv6 source aliases for outbound traffic. Dockerwall adds A and AAAA answers to separate address-family-specific ipsets, then applies the default-deny policy through `iptables` and `ip6tables`.
 
+Dedicated host IPv6 aliases use `preferred_lft 0 valid_lft forever`: they remain valid for pasta's explicit source binding, but ordinary host traffic prefers the interface's normal, non-deprecated address. Re-running `prepare-network` also applies these lifetimes to the policy's reused alias. Aliases left behind by older versions must also be deprecated (or removed once no longer used); updating the binary alone does not repair existing host addresses.
+
 Run the rootless end-to-end test with:
 ```bash
 ./test-rootless-podman.sh

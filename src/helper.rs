@@ -100,7 +100,6 @@ async fn prepare_rootless_podman_network(
     let source_ipv6 =
         allocate_rootless_podman_source_ipv6(ip6tables_binary, ip_binary, &interface, name).await?;
     let source_ipv6_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/128"));
-    let source_ipv6_pasta_cidr = source_ipv6.map(|source_ipv6| format!("{source_ipv6}/64"));
 
     run_command_checked(
         ip_binary,
@@ -113,19 +112,8 @@ async fn prepare_rootless_podman_network(
         ],
     )
     .await?;
-    if let Some(source_ipv6_pasta_cidr) = &source_ipv6_pasta_cidr {
-        run_command_checked(
-            ip_binary,
-            [
-                OsString::from("-6"),
-                OsString::from("addr"),
-                OsString::from("replace"),
-                OsString::from(source_ipv6_pasta_cidr),
-                OsString::from("dev"),
-                OsString::from(&interface),
-            ],
-        )
-        .await?;
+    if let Some(source_ipv6) = source_ipv6 {
+        configure_rootless_podman_source_ipv6(ip_binary, &interface, source_ipv6).await?;
     }
     destroy_ipsets(ipset_binary, name).await?;
     create_ipsets(ipset_binary, name).await?;
@@ -406,6 +394,32 @@ async fn allocate_rootless_podman_source_ipv6(
     }
 
     Err("all managed rootless Podman IPv6 source addresses are in use".into())
+}
+
+async fn configure_rootless_podman_source_ipv6(
+    ip_binary: &str,
+    interface: &str,
+    source_ipv6: Ipv6Addr,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Pasta binds this address explicitly. Deprecate it so unrelated host traffic
+    // prefers the normal interface address instead of inheriting this policy.
+    run_command_checked(
+        ip_binary,
+        [
+            OsString::from("-6"),
+            OsString::from("addr"),
+            OsString::from("replace"),
+            OsString::from(format!("{source_ipv6}/64")),
+            OsString::from("dev"),
+            OsString::from(interface),
+            OsString::from("preferred_lft"),
+            OsString::from("0"),
+            OsString::from("valid_lft"),
+            OsString::from("forever"),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 async fn rootless_podman_ipv6_prefix(
@@ -1226,9 +1240,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ROOTLESS_DNS_IP, allocate_rootless_podman_source_ipv6, delete_args,
-        output_rule_source_ipv6, rootless_podman_source_ip, rootless_podman_source_ipv6,
-        subnet_and_gateway, validate_interface_name,
+        ROOTLESS_DNS_IP, allocate_rootless_podman_source_ipv6,
+        configure_rootless_podman_source_ipv6, delete_args, output_rule_source_ipv6,
+        rootless_podman_source_ip, rootless_podman_source_ipv6, subnet_and_gateway,
+        validate_interface_name,
     };
 
     #[test]
@@ -1287,7 +1302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_rootless_preparation_reuses_its_ipv6_address() {
+    async fn rootless_preparation_deprecates_new_and_reused_ipv6_addresses() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1301,6 +1316,7 @@ mod tests {
         let ip_binary = directory.join("ip");
         let ip6tables_binary = directory.join("ip6tables");
         let assigned_addresses = directory.join("assigned-addresses");
+        let configured_addresses = directory.join("configured-addresses");
         let firewall_rules = directory.join("firewall-rules");
 
         fs::write(
@@ -1323,9 +1339,14 @@ if [ "$1" = "-o" ] && [ "$2" = "-6" ] && [ "$3" = "addr" ] && [ "$4" = "show" ] 
   fi
   exit 0
 fi
+if [ "$1" = "-6" ] && [ "$2" = "addr" ] && [ "$3" = "replace" ]; then
+  printf '%s\n' "$*" >> '{configured}'
+  exit 0
+fi
 exit 2
 "#,
-                assigned = assigned_addresses.display()
+                assigned = assigned_addresses.display(),
+                configured = configured_addresses.display()
             ),
         )
         .unwrap();
@@ -1353,6 +1374,9 @@ exit 2
         .unwrap()
         .unwrap();
 
+        configure_rootless_podman_source_ipv6(ip_binary.to_str().unwrap(), "test0", first)
+            .await
+            .unwrap();
         fs::write(&assigned_addresses, format!("{first}\n")).unwrap();
         fs::write(
             &firewall_rules,
@@ -1372,7 +1396,16 @@ exit 2
         .unwrap()
         .unwrap();
 
+        configure_rootless_podman_source_ipv6(ip_binary.to_str().unwrap(), "test0", second)
+            .await
+            .unwrap();
         assert_eq!(second, first);
+        let expected =
+            format!("-6 addr replace {first}/64 dev test0 preferred_lft 0 valid_lft forever\n");
+        assert_eq!(
+            fs::read_to_string(&configured_addresses).unwrap(),
+            expected.repeat(2)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
