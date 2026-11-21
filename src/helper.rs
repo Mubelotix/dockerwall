@@ -11,8 +11,9 @@ use tokio::time::sleep;
 
 use crate::cli::ContainerRuntime;
 use crate::control::get_dns_port;
-use crate::ipset::ipv6_ipset_name;
+use crate::ipset::{ipset_specs, ipv6_ipset_name, port_ipset_name, validate_ipset_name};
 use crate::manage::send_create;
+use crate::state::ManagedIpset;
 use crate::trust::is_trusted_binary;
 
 const IPSET_CANDIDATES: [&str; 3] = ["/usr/sbin/ipset", "/sbin/ipset", "/usr/bin/ipset"];
@@ -33,28 +34,30 @@ const SUBNET_SLOTS: u64 = 256 * USABLE_HOSTS_PER_SUBNET as u64;
 
 pub async fn prepare_network(
     name: &str,
-    domain_patterns: &[String],
+    allowed_destinations: &[String],
     runtime: ContainerRuntime,
     interface: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    validate_ipset_name(name)?;
+    ManagedIpset::parse(&allowed_destinations.join(","))?;
     match runtime {
         ContainerRuntime::Docker => {
             if interface.is_some() {
                 return Err("--interface is only valid with --runtime podman".into());
             }
-            prepare_docker_network(name, domain_patterns).await
+            prepare_docker_network(name, allowed_destinations).await
         }
         // Podman uses pasta in the calling user's rootless session. Dockerwall
         // configures only host resources and never enters that user namespace.
         ContainerRuntime::Podman => {
-            prepare_rootless_podman_network(name, domain_patterns, interface).await
+            prepare_rootless_podman_network(name, allowed_destinations, interface).await
         }
     }
 }
 
 async fn prepare_docker_network(
     name: &str,
-    domain_patterns: &[String],
+    allowed_destinations: &[String],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let dns_port = get_dns_port().await?;
 
@@ -63,7 +66,7 @@ async fn prepare_docker_network(
         let plan = NetworkPlan::new(name, dns_port, attempt);
         match setup_docker_resources(&plan).await {
             Ok(()) => {
-                send_create(name, Some(&plan.subnet), domain_patterns).await?;
+                send_create(name, Some(&plan.subnet), allowed_destinations).await?;
                 return Ok(());
             }
             Err(err) => {
@@ -79,7 +82,7 @@ async fn prepare_docker_network(
 
 async fn prepare_rootless_podman_network(
     name: &str,
-    domain_patterns: &[String],
+    allowed_destinations: &[String],
     requested_interface: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     ensure_host_root()?;
@@ -127,7 +130,7 @@ async fn prepare_rootless_podman_network(
         dns_port,
     )
     .await?;
-    send_create(name, Some(&source_cidr), domain_patterns).await?;
+    send_create(name, Some(&source_cidr), allowed_destinations).await?;
 
     println!("rootless Podman source IP: {source_ip}");
     println!("rootless Podman interface: {interface}");
@@ -540,7 +543,7 @@ async fn resolve_binary(
 }
 
 async fn destroy_ipsets(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for name in [name.to_owned(), ipv6_ipset_name(name)] {
+    for (name, _, _) in ipset_specs(name) {
         let _ =
             run_command_allow_failure(binary, [OsString::from("destroy"), OsString::from(name)])
                 .await;
@@ -548,14 +551,21 @@ async fn destroy_ipsets(binary: &str, name: &str) -> Result<(), Box<dyn Error + 
     Ok(())
 }
 
+pub async fn ensure_ipsets(name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    create_ipsets(resolve_binary(&IPSET_CANDIDATES).await?, name).await
+}
+
 async fn create_ipsets(binary: &str, name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    create_ipset(binary, name, "inet").await?;
-    create_ipset(binary, &ipv6_ipset_name(name), "inet6").await
+    for (name, kind, family) in ipset_specs(name) {
+        create_ipset(binary, &name, kind, family).await?;
+    }
+    Ok(())
 }
 
 async fn create_ipset(
     binary: &str,
     name: &str,
+    kind: &str,
     family: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let result = run_command_allow_failure(
@@ -563,7 +573,7 @@ async fn create_ipset(
         [
             OsString::from("create"),
             OsString::from(name),
-            OsString::from("hash:ip"),
+            OsString::from(kind),
             OsString::from("family"),
             OsString::from(family),
             OsString::from("maxelem"),
@@ -576,7 +586,10 @@ async fn create_ipset(
         return Ok(());
     }
 
-    let tmp_name = format!("{name}-tmp");
+    // Leave room for the temporary name even when the target uses all 31 bytes.
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    let tmp_name = format!("dw-tmp-{:016x}", hasher.finish());
     let _ = run_command_allow_failure(
         binary,
         [OsString::from("destroy"), OsString::from(&tmp_name)],
@@ -587,7 +600,7 @@ async fn create_ipset(
         [
             OsString::from("create"),
             OsString::from(&tmp_name),
-            OsString::from("hash:ip"),
+            OsString::from(kind),
             OsString::from("family"),
             OsString::from(family),
             OsString::from("maxelem"),
@@ -688,34 +701,13 @@ async fn ensure_docker_iptables_rules(
         ],
     )
     .await?;
+    ensure_allow_rules(binary, "DOCKER-USER", 2, &plan.subnet, &plan.name, false).await?;
     ensure_rule_present(
         binary,
         &[
             OsString::from("-I"),
             OsString::from("DOCKER-USER"),
-            OsString::from("2"),
-            OsString::from("-m"),
-            OsString::from("comment"),
-            OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{}:allow", plan.name)),
-            OsString::from("-s"),
-            OsString::from(&plan.subnet),
-            OsString::from("-m"),
-            OsString::from("set"),
-            OsString::from("--match-set"),
-            OsString::from(&plan.name),
-            OsString::from("dst"),
-            OsString::from("-j"),
-            OsString::from("ACCEPT"),
-        ],
-    )
-    .await?;
-    ensure_rule_present(
-        binary,
-        &[
-            OsString::from("-I"),
-            OsString::from("DOCKER-USER"),
-            OsString::from("3"),
+            OsString::from("4"),
             OsString::from("-m"),
             OsString::from("comment"),
             OsString::from("--comment"),
@@ -734,7 +726,7 @@ async fn ensure_docker_iptables_rules(
         &[
             OsString::from("-I"),
             OsString::from("DOCKER-USER"),
-            OsString::from("4"),
+            OsString::from("5"),
             OsString::from("-m"),
             OsString::from("comment"),
             OsString::from("--comment"),
@@ -896,34 +888,13 @@ async fn ensure_rootless_podman_rules(
         ],
     )
     .await?;
+    ensure_allow_rules(binary, PODMAN_OUTPUT_CHAIN, 4, source_cidr, name, false).await?;
     ensure_rule_present(
         binary,
         &[
             OsString::from("-I"),
             OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("4"),
-            OsString::from("-s"),
-            OsString::from(source_cidr),
-            OsString::from("-m"),
-            OsString::from("comment"),
-            OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{name}:allow")),
-            OsString::from("-m"),
-            OsString::from("set"),
-            OsString::from("--match-set"),
-            OsString::from(name),
-            OsString::from("dst"),
-            OsString::from("-j"),
-            OsString::from("ACCEPT"),
-        ],
-    )
-    .await?;
-    ensure_rule_present(
-        binary,
-        &[
-            OsString::from("-I"),
-            OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("5"),
+            OsString::from("6"),
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-m"),
@@ -1037,34 +1008,13 @@ async fn ensure_rootless_podman_ipv6_rules(
         )
         .await?;
     }
+    ensure_allow_rules(binary, PODMAN_OUTPUT_CHAIN, 4, source_cidr, name, true).await?;
     ensure_rule_present(
         binary,
         &[
             OsString::from("-I"),
             OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("4"),
-            OsString::from("-s"),
-            OsString::from(source_cidr),
-            OsString::from("-m"),
-            OsString::from("comment"),
-            OsString::from("--comment"),
-            OsString::from(format!("dockerwall:{name}:allow")),
-            OsString::from("-m"),
-            OsString::from("set"),
-            OsString::from("--match-set"),
-            OsString::from(ipv6_ipset_name(name)),
-            OsString::from("dst"),
-            OsString::from("-j"),
-            OsString::from("ACCEPT"),
-        ],
-    )
-    .await?;
-    ensure_rule_present(
-        binary,
-        &[
-            OsString::from("-I"),
-            OsString::from(PODMAN_OUTPUT_CHAIN),
-            OsString::from("5"),
+            OsString::from("6"),
             OsString::from("-s"),
             OsString::from(source_cidr),
             OsString::from("-m"),
@@ -1077,6 +1027,66 @@ async fn ensure_rootless_podman_ipv6_rules(
     )
     .await?;
     Ok(())
+}
+
+async fn ensure_allow_rules(
+    binary: &str,
+    chain: &str,
+    position: u32,
+    source_cidr: &str,
+    name: &str,
+    ipv6: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for args in allow_rule_args(chain, position, source_cidr, name, ipv6) {
+        ensure_rule_present(binary, &args).await?;
+    }
+    Ok(())
+}
+
+fn allow_rule_args(
+    chain: &str,
+    position: u32,
+    source_cidr: &str,
+    name: &str,
+    ipv6: bool,
+) -> [[OsString; 16]; 2] {
+    let address_set = if ipv6 {
+        ipv6_ipset_name(name)
+    } else {
+        name.to_owned()
+    };
+    [
+        (position, "allow", address_set, "dst"),
+        (
+            position + 1,
+            "allow-port",
+            port_ipset_name(name, ipv6),
+            "dst,dst",
+        ),
+    ]
+    .map(|(position, rule, set, dimensions)| {
+        let position = position.to_string();
+        let comment = format!("dockerwall:{name}:{rule}");
+        [
+            "-I",
+            chain,
+            &position,
+            "-s",
+            source_cidr,
+            "-m",
+            "comment",
+            "--comment",
+            &comment,
+            "-m",
+            "set",
+            "--match-set",
+            &set,
+            dimensions,
+            "-j",
+            "ACCEPT",
+        ]
+        .map(OsString::from)
+    })
 }
 
 async fn ensure_rootless_dns_redirects(
@@ -1240,11 +1250,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ROOTLESS_DNS_IP, allocate_rootless_podman_source_ipv6,
-        configure_rootless_podman_source_ipv6, delete_args, output_rule_source_ipv6,
-        rootless_podman_source_ip, rootless_podman_source_ipv6, subnet_and_gateway,
-        validate_interface_name,
+        PODMAN_OUTPUT_CHAIN, ROOTLESS_DNS_IP, allocate_rootless_podman_source_ipv6,
+        allow_rule_args, configure_rootless_podman_source_ipv6, delete_args,
+        output_rule_source_ipv6, rootless_podman_source_ip, rootless_podman_source_ipv6,
+        subnet_and_gateway, validate_interface_name,
     };
+
+    #[test]
+    fn port_allow_rules_match_destination_address_and_destination_port() {
+        for (chain, source, ipv6, base, port_set) in [
+            ("DOCKER-USER", "172.30.1.0/28", false, 2, "test-p"),
+            (PODMAN_OUTPUT_CHAIN, "198.18.1.1/32", false, 4, "test-p"),
+            (PODMAN_OUTPUT_CHAIN, "2001:db8::1/128", true, 4, "test-p6"),
+        ] {
+            let [address, port] = allow_rule_args(chain, base, source, "test", ipv6);
+            assert_eq!(
+                &address[11..14],
+                ["--match-set", if ipv6 { "test-v6" } else { "test" }, "dst"]
+            );
+            assert_eq!(
+                &port[..5],
+                ["-I", chain, &(base + 1).to_string(), "-s", source]
+            );
+            assert_eq!(
+                &port[11..],
+                ["--match-set", port_set, "dst,dst", "-j", "ACCEPT"]
+            );
+        }
+    }
 
     #[test]
     fn generated_gateways_are_valid_for_their_subnets() {

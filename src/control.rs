@@ -9,6 +9,8 @@ use tokio::spawn;
 use tokio::time::timeout;
 use std::time::Duration;
 
+use crate::helper::ensure_ipsets;
+use crate::ipset::{replace_policy, validate_ipset_name};
 use crate::state::{ManagedIpset, STATE};
 use crate::stats::{get_stats_report, register_network};
 
@@ -63,32 +65,12 @@ async fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Res
         let mut parts = rest.splitn(3, '\t');
         let name = parts.next().ok_or("missing ipset name")?.trim();
         let subnet = parts.next().ok_or("missing subnet")?.trim();
-        let raw_domains = parts.next().ok_or("missing domains")?;
+        let destinations = parts.next().ok_or("missing destinations")?;
 
-        if name.is_empty() {
-            stream.write_all(b"ERR\tmissing ipset name\n").await?;
+        if let Err(err) = create_policy(name, subnet, destinations).await {
+            stream.write_all(format!("ERR\t{err}\n").as_bytes()).await?;
             return Ok(());
         }
-
-        if !subnet.is_empty() {
-            register_network(name.to_owned(), subnet.to_owned()).await;
-        }
-
-        let allowed_domain_patterns: Vec<String> = raw_domains
-            .split(',')
-            .map(str::trim)
-            .filter(|domain| !domain.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-
-        let mut state = STATE.write().await;
-        state.insert(
-            name.to_owned(),
-            ManagedIpset {
-                allowed_domain_patterns,
-                ips: Default::default(),
-            },
-        );
 
         stream.write_all(b"OK\tcreated\n").await?;
         return Ok(());
@@ -102,12 +84,40 @@ async fn handle_control_connection(mut stream: UnixStream, dns_port: u16) -> Res
         }
 
         let mut state = STATE.write().await;
-        state.remove(name);
+        if state.contains_key(name) {
+            if let Err(err) = replace_policy(name, &ManagedIpset::default()).await {
+                stream.write_all(format!("ERR\t{err}\n").as_bytes()).await?;
+                return Ok(());
+            }
+            state.remove(name);
+        }
         stream.write_all(b"OK\tremoved\n").await?;
         return Ok(());
     }
 
     stream.write_all(b"ERR\tunknown command\n").await?;
+    Ok(())
+}
+
+async fn create_policy(
+    name: &str,
+    subnet: &str,
+    destinations: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    validate_ipset_name(name)?;
+    let policy = ManagedIpset::parse(destinations)?;
+    {
+        let mut state = STATE.write().await;
+        if subnet.is_empty() {
+            // prepare-network provisions the sets before attaching firewall rules.
+            ensure_ipsets(name).await?;
+        }
+        replace_policy(name, &policy).await?;
+        state.insert(name.to_owned(), policy);
+    }
+    if !subnet.is_empty() {
+        register_network(name.to_owned(), subnet.to_owned()).await;
+    }
     Ok(())
 }
 

@@ -45,13 +45,13 @@ async fn main() {
             runtime,
             interface,
             name,
-            domain_patterns,
-        } => prepare_network(&name, &domain_patterns, runtime, interface.as_deref()).await,
+            allowed_destinations,
+        } => prepare_network(&name, &allowed_destinations, runtime, interface.as_deref()).await,
         Commands::Ipset { command } => match command {
             IpsetCommands::Create {
                 name,
-                allowed_domains,
-            } => send_create(&name, None, &allowed_domains).await,
+                allowed_destinations,
+            } => send_create(&name, None, &allowed_destinations).await,
             IpsetCommands::Remove { name } => send_remove(&name).await,
         },
     };

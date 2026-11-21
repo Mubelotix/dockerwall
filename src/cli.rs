@@ -26,7 +26,7 @@ pub enum Commands {
         #[arg(long, default_value = "86400")]
         stats_ttl: u64,
     },
-    /// Prepare a container network, ipset, and firewall rules for allowed domains.
+    /// Prepare a container network with firewall rules for allowed destinations.
     PrepareNetwork {
         #[arg(long, value_enum, default_value = "docker")]
         runtime: ContainerRuntime,
@@ -34,8 +34,9 @@ pub enum Commands {
         #[arg(long)]
         interface: Option<String>,
         name: String,
+        /// Domain pattern, IP address, or IP:port (use [IPv6]:port for IPv6).
         #[arg(num_args = 0..)]
-        domain_patterns: Vec<String>,
+        allowed_destinations: Vec<String>,
     },
     /// Manage daemon-controlled ipsets.
     Ipset {
@@ -46,11 +47,12 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum IpsetCommands {
-    /// Create an ipset with one or more allowed domains.
+    /// Create or replace a daemon-managed destination policy.
     Create {
         name: String,
+        /// Domain pattern, IP address, or IP:port (use [IPv6]:port for IPv6).
         #[arg(num_args = 0..)]
-        allowed_domains: Vec<String>,
+        allowed_destinations: Vec<String>,
     },
     /// Remove an existing ipset.
     Remove { name: String },

@@ -18,7 +18,6 @@ use tokio::spawn;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::timeout;
 
-use crate::ipset::update_ipset;
 use crate::state::apply_resolved_ips;
 use crate::stats::record_resolve;
 
@@ -226,21 +225,7 @@ async fn inspect_and_update_state(response: &[u8], origin: IpAddr, stats_ttl: Du
         domains.push(domain);
     }
 
-    if resolved_ips.is_empty() {
-        return Ok(());
-    }
-
-    let changed_sets = apply_resolved_ips(&domains, &resolved_ips).await;
-    if changed_sets.is_empty() {
-        return Ok(());
-    }
-
-    for (name, ips) in changed_sets {
-        if let Err(err) = update_ipset(name.clone(), ips).await {
-            eprintln!("ipset update error for {name}: {err}");
-        }
-    }
-
+    apply_resolved_ips(&domains, &resolved_ips).await;
     Ok(())
 }
 

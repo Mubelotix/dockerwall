@@ -35,6 +35,8 @@ sudo dockerwall prepare-network secure-net "*.example.com"
 ```
 *(Under the hood, Dockerwall creates the bridge network, establishes the iptables DROP/ACCEPT rules, creates the ipset, and sets up transparent DNS rerouting.)*
 
+The allowlist also accepts literal IPs (`192.0.2.10`) and TCP/UDP destinations with a port (`192.0.2.20:443`, or `'[2001:db8::20]:443'` where IPv6 is enabled).
+
 ### Rootless Podman With Pasta
 
 Rootless Podman uses host-root Dockerwall policy resources. Preparing the logical policy name reserves the host-only `198.18.0.1/32` alias on `lo` and starts an external host daemon when no responsive control socket exists:

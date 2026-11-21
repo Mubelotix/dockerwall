@@ -1,9 +1,16 @@
 use std::error::Error;
 use crate::control::send_control_command;
 
-pub async fn send_create(name: &str, subnet: Option<&str>, allowed_domains: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn send_create(
+    name: &str,
+    subnet: Option<&str>,
+    allowed_destinations: &[String],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let subnet = subnet.unwrap_or("");
-    let payload = format!("CREATE\t{name}\t{subnet}\t{}\n", allowed_domains.join(","));
+    let payload = format!(
+        "CREATE\t{name}\t{subnet}\t{}\n",
+        allowed_destinations.join(",")
+    );
     send_control_command(&payload).await?;
     println!("requested creation of ipset '{name}'");
     Ok(())
